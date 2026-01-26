@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>行政人員入口網站 (代辦追蹤版)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dayjs/1.11.10/dayjs.min.js"></script>
+    <style> 
+        body { font-family: 'Noto Sans TC', sans-serif; background-color: #f3f4f6; -webkit-tap-highlight-color: transparent; } 
+        .btn-press:active { transform: scale(0.95); transition: transform 0.1s; }
+        .modal { transition: opacity 0.25s ease; }
+        .tab-active { color: #2563eb; border-bottom: 2px solid #2563eb; }
+        .tab-inactive { color: #94a3b8; }
+    </style>
+
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+        import { getFirestore, collection, addDoc, onSnapshot, query, where, deleteDoc, doc } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+
+        const firebaseConfig = {
+            apiKey: "AIzaSyDkC6kfqpmEeMKIvWIqftounTSH_NPp25M",
+            authDomain: "assessmentsystem-9e2ec.firebaseapp.com",
+            projectId: "assessmentsystem-9e2ec",
+            storageBucket: "assessmentsystem-9e2ec.firebasestorage.app",
+            messagingSenderId: "455151254122",
+            appId: "1:455151254122:web:45787cfce4469bff90e813",
+            measurementId: "G-201C6BE86Z"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+
+        let currentUser = null;
+        let todayAttendance = null;
+        let currentTab = 'my'; // 'my' or 'proxy'
+
+        window.loginAs = loginAs;
+        window.clockIn = clockIn;
+        window.clockOut = clockOut;
+        window.openModal = openModal;
+        window.closeModal = closeModal;
+        window.submitLeave = submitLeave;
+        window.submitOvertime = submitOvertime;
+        window.deleteRequest = deleteRequest;
+        window.switchRequestTab = switchRequestTab;
+
+        // 1. 初始化
+        import { orderBy } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+        const qEmp = query(collection(db, "employees"), orderBy("code"));
+        onSnapshot(qEmp, (snapshot) => {
+            const sel = document.getElementById('user-select');
+            sel.innerHTML = '<option value="">-- 請選擇您的身分 --</option>';
+            let hasAdmin = false;
+            snapshot.forEach(doc => {
+                const e = doc.data();
+                if(e.role === 'admin' && !e.resignDate) { 
+                    sel.innerHTML += `<option value="${doc.id}" data-name="${e.name}" data-role="${e.role}">👤 ${e.name}</option>`;
+                    hasAdmin = true;
+                }
+            });
+            if(!hasAdmin) sel.innerHTML = '<option value="">(無在職行政人員)</option>';
+        });
+
+        // 2. 登入
+        function loginAs(select) {
+            const opt = select.options[select.selectedIndex];
+            if(!opt.value) return;
+            currentUser = { id: opt.value, name: opt.dataset.name, role: opt.dataset.role };
+            document.getElementById('login-panel').classList.add('hidden');
+            document.getElementById('main-panel').classList.remove('hidden');
+            document.getElementById('welcome-name').innerText = currentUser.name;
+            loadTodayAttendance();
+            loadRequests();
+        }
+
+        // 3. 載入今日打卡
+        function loadTodayAttendance() {
+            const todayStr = dayjs().format('YYYY-MM-DD');
+            const q = query(collection(db, "attendance"), where("empId", "==", currentUser.id), where("date", "==", todayStr));
+            onSnapshot(q, (snap) => {
+                if(!snap.empty) {
+                    todayAttendance = { id: snap.docs[0].id, ...snap.docs[0].data() };
+                    updateClockUI();
+                } else {
+                    todayAttendance = null;
+                    resetClockUI();
+                }
+            });
+        }
+
+        function updateClockUI() {
+            if(todayAttendance.inTime) {
+                const btn = document.getElementById('btn-clock-in');
+                btn.classList.add('opacity-50', 'pointer-events-none', 'bg-gray-100', 'border-gray-200');
+                btn.classList.remove('border-blue-100', 'bg-white');
+                btn.innerHTML = `<span class="text-3xl grayscale">🌞</span><div class="font-bold text-slate-500">已簽到 ${todayAttendance.inTime}</div>`;
+            }
+            if(todayAttendance.outTime) {
+                const btn = document.getElementById('btn-clock-out');
+                btn.classList.add('opacity-50', 'pointer-events-none', 'bg-gray-100', 'border-gray-200');
+                btn.classList.remove('border-slate-100', 'bg-white');
+                btn.innerHTML = `<span class="text-3xl grayscale">🌙</span><div class="font-bold text-slate-500">已簽退 ${todayAttendance.outTime}</div>`;
+            }
+        }
+
+        function resetClockUI() {
+            const inBtn = document.getElementById('btn-clock-in');
+            inBtn.className = "bg-white p-4 rounded-xl shadow-md flex flex-col items-center justify-center gap-2 btn-press border-b-4 border-blue-100 h-28 cursor-pointer";
+            inBtn.innerHTML = `<span class="text-3xl">🌞</span><span class="font-bold text-slate-700">上班打卡</span>`;
+            
+            const outBtn = document.getElementById('btn-clock-out');
+            outBtn.className = "bg-white p-4 rounded-xl shadow-md flex flex-col items-center justify-center gap-2 btn-press border-b-4 border-slate-100 h-28 cursor-pointer";
+            outBtn.innerHTML = `<span class="text-3xl">🌙</span><span class="font-bold text-slate-700">下班打卡</span>`;
+        }
+
+        async function clockIn() {
+            const now = dayjs();
+            const timeStr = now.format('HH:mm');
+            const dateStr = now.format('YYYY-MM-DD');
+            try { await addDoc(collection(db, "attendance"), { empId: currentUser.id, name: currentUser.name, date: dateStr, inTime: timeStr, outTime: null, timestamp: new Date().toISOString() }); alert(`打卡成功！時間：${timeStr}`); } catch(e) { console.error(e); alert("打卡失敗"); }
+        }
+        async function clockOut() { alert("下班打卡需配合後端邏輯。"); }
+
+        // 5. 申請單
+        async function submitLeave() {
+            const date = document.getElementById('leave-date').value; const type = document.getElementById('leave-type').value; const hours = document.getElementById('leave-hours').value; const note = document.getElementById('leave-note').value;
+            if(!date || !hours) return alert("請填寫完整");
+            try { await addDoc(collection(db, "requests"), { empId: currentUser.id, name: currentUser.name, category: "leave", type, date, hours: Number(hours), note, status: "pending", createdAt: new Date().toISOString() }); closeModal('modal-leave'); alert("申請已送出！"); } catch(e) { alert("失敗"); }
+        }
+        async function submitOvertime() {
+            const date = document.getElementById('ot-date').value; const hours = document.getElementById('ot-hours').value; const note = document.getElementById('ot-note').value;
+            if(!date || !hours) return alert("請填寫完整");
+            try { await addDoc(collection(db, "requests"), { empId: currentUser.id, name: currentUser.name, category: "overtime", date, hours: Number(hours), note, status: "pending", createdAt: new Date().toISOString() }); closeModal('modal-ot'); alert("申請已送出！"); } catch(e) { alert("失敗"); }
+        }
+
+        // 6. 紀錄切換與讀取 (★ 重點修正)
+        function switchRequestTab(tab) {
+            currentTab = tab;
+            // UI 更新
+            document.getElementById('tab-my').className = tab === 'my' ? 'flex-1 text-center py-2 font-bold cursor-pointer tab-active' : 'flex-1 text-center py-2 font-bold cursor-pointer tab-inactive hover:bg-slate-100';
+            document.getElementById('tab-proxy').className = tab === 'proxy' ? 'flex-1 text-center py-2 font-bold cursor-pointer tab-active' : 'flex-1 text-center py-2 font-bold cursor-pointer tab-inactive hover:bg-slate-100';
+            loadRequests();
+        }
+
+        function loadRequests() {
+            // 判斷查詢條件
+            let q;
+            if (currentTab === 'my') {
+                // 查「我自己」的假 (empId = me)
+                q = query(collection(db, "requests"), where("empId", "==", currentUser.id));
+            } else {
+                // 查「我代辦」的假 (createdBy = me)
+                // 注意：這需要配合後台 submitProxyRequest 寫入 createdBy
+                q = query(collection(db, "requests"), where("createdBy", "==", currentUser.id));
+            }
+            
+            onSnapshot(q, (snap) => {
+                const list = document.getElementById('request-list');
+                list.innerHTML = "";
+                
+                let records = [];
+                snap.forEach(doc => records.push({ id: doc.id, ...doc.data() }));
+                // 前端排序
+                records.sort((a, b) => dayjs(b.createdAt).unix() - dayjs(a.createdAt).unix());
+                
+                if(records.length === 0) {
+                    list.innerHTML = `<div class="text-center text-gray-400 py-10 bg-white rounded-xl border border-dashed border-gray-300">尚無${currentTab==='my'?'個人':'代辦'}紀錄</div>`;
+                    return;
+                }
+
+                records.forEach(r => {
+                    let cardClass = "bg-white border-gray-100";
+                    let statusBadge = "";
+                    let rejectSection = "";
+                    let deleteBtn = "";
+
+                    if(r.status === 'pending') {
+                        statusBadge = `<span class="bg-yellow-100 text-yellow-700 px-2 py-1 rounded text-xs font-bold shadow-sm">⏳ 審核中</span>`;
+                    } else if(r.status === 'approved') {
+                        statusBadge = `<span class="bg-green-100 text-green-700 px-2 py-1 rounded text-xs font-bold shadow-sm">✅ 已核准</span>`;
+                    } else {
+                        cardClass = "bg-red-50 border-red-200";
+                        statusBadge = `<span class="bg-red-600 text-white px-2 py-1 rounded text-xs font-bold shadow-sm">🚫 已駁回</span>`;
+                        rejectSection = `
+                            <div class="mt-3 bg-white/60 p-3 rounded-lg border border-red-100 text-xs text-red-600 font-bold">
+                                <span class="block text-[10px] text-red-400 mb-1">駁回原因：</span>
+                                ${r.rejectReason || '（未填寫原因）'}
+                            </div>
+                        `;
+                        deleteBtn = `<button onclick="deleteRequest('${r.id}')" class="text-red-400 hover:text-red-600 text-xs font-bold border border-red-200 bg-white px-2 py-1 rounded shadow-sm">🗑️ 刪除通知</button>`;
+                    }
+
+                    // 區分是誰的假
+                    let nameDisplay = "";
+                    if(currentTab === 'proxy') {
+                        // 如果是代辦，顯示「幫誰請」
+                        nameDisplay = `<span class="text-[10px] bg-slate-100 text-slate-500 px-1 rounded ml-2">For: ${r.name}</span>`;
+                    }
+
+                    let title = r.category === 'leave' ? `請假：${r.type}` : `加班申請`;
+                    let icon = r.category === 'leave' ? '🌴' : '⚡';
+                    
+                    list.innerHTML += `
+                        <div class="p-4 rounded-xl shadow-sm border mb-3 relative group transition ${cardClass}">
+                            <div class="flex justify-between items-start">
+                                <div>
+                                    <div class="font-bold text-slate-800 text-sm flex items-center gap-2 mb-1">
+                                        <span class="text-lg">${icon}</span> 
+                                        <span>${title}</span>
+                                        ${nameDisplay}
+                                    </div>
+                                    <div class="text-xs text-slate-500 font-medium">
+                                        ${r.date} <span class="mx-1">·</span> ${r.hours} 小時
+                                    </div>
+                                    <div class="text-xs text-slate-400 mt-1">
+                                        ${r.note || '無備註'}
+                                    </div>
+                                </div>
+                                <div class="flex flex-col items-end gap-2">
+                                    ${statusBadge}
+                                    <div class="text-[10px] text-slate-400">${dayjs(r.createdAt).format('MM/DD HH:mm')}</div>
+                                </div>
+                            </div>
+                            
+                            ${rejectSection}
+
+                            ${deleteBtn ? `
+                                <div class="mt-3 flex justify-end border-t border-red-100/50 pt-2">
+                                    ${deleteBtn}
+                                </div>
+                            ` : ''}
+                        </div>
+                    `;
+                });
+            });
+        }
+
+        async function deleteRequest(id) {
+            if(confirm("確定刪除此條通知嗎？")) {
+                await deleteDoc(doc(db, "requests", id));
+            }
+        }
+
+        function openModal(id) { document.getElementById(id).classList.remove('hidden'); }
+        function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
+        setInterval(() => { document.getElementById('clock-display').innerText = dayjs().format('HH:mm:ss'); document.getElementById('date-display').innerText = dayjs().format('YYYY年MM月DD日 dddd'); }, 1000);
+    </script>
+</head>
+<body class="flex flex-col h-screen">
+
+    <div id="login-panel" class="absolute inset-0 bg-slate-800 z-50 flex flex-col items-center justify-center p-6">
+        <div class="bg-white p-6 rounded-2xl w-full max-w-sm shadow-2xl text-center">
+            <div class="text-4xl mb-4">🔐</div>
+            <h1 class="text-xl font-bold text-slate-800 mb-2">行政人員入口網站</h1>
+            <select id="user-select" class="w-full p-3 border border-slate-300 rounded-lg mb-4 bg-slate-50 font-bold outline-none text-slate-700"><option>載入中...</option></select>
+            <button onclick="loginAs(document.getElementById('user-select'))" class="w-full bg-blue-600 text-white py-3 rounded-lg font-bold shadow-lg active:scale-95 transition hover:bg-blue-700">登入系統</button>
+        </div>
+    </div>
+
+    <div id="main-panel" class="flex-1 flex flex-col hidden overflow-hidden">
+        
+        <div class="bg-blue-600 text-white p-4 pb-12 rounded-b-[2.5rem] shadow-lg shrink-0 relative z-10">
+            <div class="flex justify-between items-center mb-4">
+                <div class="flex items-center gap-2">
+                    <div class="bg-blue-500 p-2 rounded-full text-lg">👤</div>
+                    <div>
+                        <div class="text-blue-200 text-[10px] uppercase tracking-wide">Administrative Staff</div>
+                        <div class="text-lg font-bold leading-tight" id="welcome-name">---</div>
+                    </div>
+                </div>
+                <button onclick="location.reload()" class="bg-blue-500 hover:bg-blue-400 px-3 py-1 rounded-full text-xs font-bold transition">登出</button>
+            </div>
+            <div class="text-center mt-4 mb-2">
+                <div id="clock-display" class="text-5xl font-mono font-black tracking-widest drop-shadow-md">00:00:00</div>
+                <div id="date-display" class="text-sm text-blue-100 opacity-90 mt-1 font-medium">----/--/--</div>
+            </div>
+        </div>
+
+        <div class="px-6 -mt-10 relative z-20 grid grid-cols-2 gap-4 shrink-0">
+            <div id="btn-clock-in" onclick="clockIn()" class="bg-white p-4 rounded-2xl shadow-lg flex flex-col items-center justify-center gap-2 btn-press border-b-4 border-blue-100 h-32 cursor-pointer transition"><span class="text-4xl">🌞</span><span class="font-bold text-slate-700">上班打卡</span></div>
+            <div id="btn-clock-out" onclick="clockOut()" class="bg-white p-4 rounded-2xl shadow-lg flex flex-col items-center justify-center gap-2 btn-press border-b-4 border-slate-100 h-32 cursor-pointer transition"><span class="text-4xl">🌙</span><span class="font-bold text-slate-700">下班打卡</span></div>
+        </div>
+
+        <div class="px-6 mt-6 grid grid-cols-2 gap-4 shrink-0">
+            <button onclick="openModal('modal-ot')" class="bg-orange-50 hover:bg-orange-100 p-3 rounded-xl border border-orange-100 flex items-center justify-center gap-2 text-orange-700 font-bold btn-press shadow-sm transition">⚡ 申請加班</button>
+            <button onclick="openModal('modal-leave')" class="bg-green-50 hover:bg-green-100 p-3 rounded-xl border border-green-100 flex items-center justify-center gap-2 text-green-700 font-bold btn-press shadow-sm transition">🌴 申請請假</button>
+        </div>
+
+        <div class="flex-1 overflow-y-auto px-6 mt-6 pb-6 flex flex-col">
+            <div class="flex border-b border-slate-200 mb-3">
+                <div id="tab-my" onclick="switchRequestTab('my')" class="flex-1 text-center py-2 font-bold cursor-pointer tab-active">👤 我的申請</div>
+                <div id="tab-proxy" onclick="switchRequestTab('proxy')" class="flex-1 text-center py-2 font-bold cursor-pointer tab-inactive hover:bg-slate-100">📝 代辦追蹤</div>
+            </div>
+            <div id="request-list" class="space-y-3 pb-safe flex-1">
+                </div>
+        </div>
+    </div>
+
+    <div id="modal-leave" class="hidden fixed inset-0 bg-black/60 z-50 flex items-end sm:items-center justify-center backdrop-blur-sm modal">
+        <div class="bg-white w-full sm:w-96 rounded-t-3xl sm:rounded-3xl p-6 shadow-2xl animate-slide-up">
+            <h3 class="text-xl font-bold text-slate-800 mb-6 flex items-center gap-2">🌴 請假申請</h3>
+            <div class="space-y-4">
+                <div class="grid grid-cols-2 gap-4">
+                    <div><label class="text-xs text-slate-500 font-bold block mb-1">日期</label><input type="date" id="leave-date" class="w-full border rounded-xl p-3 bg-slate-50 font-bold text-slate-700 outline-none"></div>
+                    <div><label class="text-xs text-slate-500 font-bold block mb-1">假別</label>
+                        <select id="leave-type" class="w-full border rounded-xl p-3 bg-slate-50 font-bold text-slate-700 outline-none">
+                            <option value="特休">特休</option><option value="補休">補休</option><option value="病假">病假</option><option value="事假">事假</option>
+                            <option value="婚假">婚假</option><option value="喪假">喪假</option><option value="公假">公假</option><option value="產假">產假</option>
+                            <option value="陪產假">陪產假</option><option value="生理假">生理假</option><option value="家庭照顧假">家庭照顧假</option>
+                            <option value="歲時祭儀假">歲時祭儀假</option>
+                        </select>
+                    </div>
+                </div>
+                <div><label class="text-xs text-slate-500 font-bold block mb-1">時數</label><input type="number" id="leave-hours" class="w-full border rounded-xl p-3 bg-slate-50 font-bold text-slate-700" placeholder="例如: 4.0"></div>
+                <div><label class="text-xs text-slate-500 font-bold block mb-1">事由</label><input type="text" id="leave-note" class="w-full border rounded-xl p-3 bg-slate-50" placeholder="請填寫事由"></div>
+            </div>
+            <div class="mt-8 flex gap-3"><button onclick="closeModal('modal-leave')" class="flex-1 py-3 text-slate-500 font-bold rounded-xl bg-slate-100">取消</button><button onclick="submitLeave()" class="flex-1 py-3 text-white font-bold rounded-xl bg-green-600 shadow-lg">送出申請</button></div>
+        </div>
+    </div>
+
+    <div id="modal-ot" class="hidden fixed inset-0 bg-black/60 z-50 flex items-end sm:items-center justify-center backdrop-blur-sm modal">
+        <div class="bg-white w-full sm:w-96 rounded-t-3xl sm:rounded-3xl p-6 shadow-2xl animate-slide-up">
+            <h3 class="text-xl font-bold text-slate-800 mb-6 flex items-center gap-2">⚡ 加班申請</h3>
+            <div class="space-y-4">
+                <div class="grid grid-cols-2 gap-4">
+                    <div><label class="text-xs text-slate-500 font-bold block mb-1">日期</label><input type="date" id="ot-date" class="w-full border rounded-xl p-3 bg-slate-50 font-bold text-slate-700"></div>
+                    <div><label class="text-xs text-slate-500 font-bold block mb-1">時數</label><input type="number" id="ot-hours" class="w-full border rounded-xl p-3 bg-slate-50 font-bold text-slate-700" placeholder="例如: 2.0"></div>
+                </div>
+                <div><label class="text-xs text-slate-500 font-bold block mb-1">事由</label><input type="text" id="ot-note" class="w-full border rounded-xl p-3 bg-slate-50" placeholder="例如：趕評鑑資料"></div>
+            </div>
+            <div class="mt-8 flex gap-3"><button onclick="closeModal('modal-ot')" class="flex-1 py-3 text-slate-500 font-bold rounded-xl bg-slate-100">取消</button><button onclick="submitOvertime()" class="flex-1 py-3 text-white font-bold rounded-xl bg-orange-500 shadow-lg">送出申請</button></div>
+        </div>
+    </div>
+</body>
+</html>

@@ -1,0 +1,740 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>特休與補休管理系統 (排版修復版)</title>
+    <script>
+        (function() {
+            const userSession = sessionStorage.getItem('kuangyou_user');
+            if (!userSession) {
+                alert("⛔ 非法存取！\n\n請由「管理後台」登入後操作。");
+                window.location.href = 'index.html'; 
+                return;
+            }
+            try {
+                const user = JSON.parse(userSession);
+                console.log("✅ Identity Verified:", user.name);
+            } catch (e) {
+                window.location.href = 'index.html';
+            }
+        })();
+    </script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dayjs/1.11.10/dayjs.min.js"></script>
+    <style> 
+        body { font-family: 'Noto Sans TC', sans-serif; background-color: #f1f5f9; } 
+        .tab-active { background-color: #2563eb; color: white; }
+        .tab-admin-active { background-color: #7c3aed; color: white; }
+    </style>
+
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+        import { getFirestore, collection, addDoc, updateDoc, deleteDoc, doc, onSnapshot, query, orderBy, where, getDocs, writeBatch } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+
+        const firebaseConfig = {
+            apiKey: "AIzaSyDkC6kfqpmEeMKIvWIqftounTSH_NPp25M",
+            authDomain: "assessmentsystem-9e2ec.firebaseapp.com",
+            projectId: "assessmentsystem-9e2ec",
+            storageBucket: "assessmentsystem-9e2ec.firebasestorage.app",
+            messagingSenderId: "455151254122",
+            appId: "1:455151254122:web:45787cfce4469bff90e813",
+            measurementId: "G-201C6BE86Z"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+
+        // --- 全域變數 ---
+        let allEmployees = [];
+        let currentRole = 'caregiver'; 
+        let currentStatusFilter = 'active'; 
+        let currentEmpId = null;
+        let currentEmpData = null;
+        let ledgerData = []; 
+        let monthlyRecords = []; 
+        
+        let unsubscribeLedger = null;
+        let unsubscribeUsage = null;
+        let currentGrantType = ""; 
+
+        // 綁定全域
+        window.switchRole = switchRole;
+        window.filterStatus = filterStatus;
+        window.selectEmployee = selectEmployee;
+        window.runAutoGrant = runAutoGrant;
+        
+        window.openGrantModal = openGrantModal; 
+        window.closeManualModal = closeManualModal;
+        window.submitManualGrant = submitManualGrant;
+        
+        window.openCashOutModal = openCashOutModal;
+        window.closeCashOutModal = closeCashOutModal;
+        window.submitCashOut = submitCashOut;
+
+        window.addUsageRecord = addUsageRecord;
+        window.deleteUsageRecord = deleteUsageRecord;
+        window.deleteLedgerItem = deleteLedgerItem;
+
+        // 1. 初始化
+        const qEmp = query(collection(db, "employees"), orderBy("code"));
+        onSnapshot(qEmp, (snapshot) => {
+            allEmployees = [];
+            snapshot.forEach(doc => allEmployees.push({ id: doc.id, ...doc.data() }));
+            renderEmployeeList();
+        });
+
+        // 2. 切換職務
+        function switchRole(role) {
+            currentRole = role;
+            const btnCare = document.getElementById('btn-caregiver');
+            const btnAdmin = document.getElementById('btn-admin');
+            
+            if (role === 'caregiver') {
+                btnCare.className = "flex-1 py-2 text-center font-bold rounded-l-lg border transition bg-blue-600 text-white tab-active";
+                btnAdmin.className = "flex-1 py-2 text-center font-bold rounded-r-lg border transition bg-white text-slate-600 hover:bg-slate-50";
+            } else {
+                btnCare.className = "flex-1 py-2 text-center font-bold rounded-l-lg border transition bg-white text-slate-600 hover:bg-slate-50";
+                btnAdmin.className = "flex-1 py-2 text-center font-bold rounded-r-lg border transition bg-purple-600 text-white tab-admin-active";
+            }
+            currentEmpId = null;
+            document.getElementById('right-panel').classList.add('hidden');
+            document.getElementById('empty-panel').classList.remove('hidden');
+            renderEmployeeList();
+        }
+
+        // 3. 篩選
+        function filterStatus(status) {
+            currentStatusFilter = status;
+            renderEmployeeList();
+        }
+
+        function renderEmployeeList() {
+            const list = document.getElementById('emp-list');
+            list.innerHTML = "";
+            const filtered = allEmployees.filter(e => {
+                if (e.role !== currentRole) return false;
+                if (currentStatusFilter === 'active') return !e.resignDate;
+                if (currentStatusFilter === 'resigned') return !!e.resignDate;
+                return true;
+            });
+
+            if(filtered.length === 0) {
+                list.innerHTML = `<div class="p-8 text-center text-slate-400 text-sm">無符合資料</div>`;
+                return;
+            }
+
+            filtered.forEach(e => {
+                const isResigned = !!e.resignDate;
+                const statusBadge = isResigned ? '<span class="text-[10px] bg-red-100 text-red-600 px-1.5 py-0.5 rounded font-bold ml-2">離職</span>' : '';
+                const isActive = e.id === currentEmpId;
+                let activeClass = "bg-slate-100";
+                if(isActive) activeClass = currentRole === 'caregiver' ? 'bg-blue-50 border-l-4 border-blue-600' : 'bg-purple-50 border-l-4 border-purple-600';
+                else activeClass = 'hover:bg-slate-50 border-l-4 border-transparent';
+                
+                list.innerHTML += `
+                    <div onclick="selectEmployee('${e.id}')" class="p-3 cursor-pointer border-b transition ${activeClass}">
+                        <div class="flex justify-between items-center">
+                            <div class="font-bold text-slate-700 text-sm">${e.name} ${statusBadge}</div>
+                            <div class="text-xs text-slate-400 font-mono">${e.code}</div>
+                        </div>
+                        <div class="text-xs text-slate-400 mt-1">到職: ${e.joinDate}</div>
+                    </div>`;
+            });
+        }
+
+        // 4. 選擇員工
+        async function selectEmployee(id) {
+            if (unsubscribeLedger) unsubscribeLedger();
+            if (unsubscribeUsage) unsubscribeUsage();
+
+            currentEmpId = id;
+            currentEmpData = allEmployees.find(e => e.id === id);
+            renderEmployeeList();
+
+            document.getElementById('right-panel').classList.remove('hidden');
+            document.getElementById('empty-panel').classList.add('hidden');
+            
+            document.getElementById('header-name').innerText = currentEmpData.name;
+            document.getElementById('header-join').innerText = currentEmpData.joinDate;
+            const seniority = calculateSeniority(currentEmpData.joinDate);
+            document.getElementById('header-seniority').innerText = seniority.text;
+
+            if (currentEmpData.resignDate) {
+                document.getElementById('resign-alert').classList.remove('hidden');
+                document.getElementById('resign-date').innerText = currentEmpData.resignDate;
+            } else {
+                document.getElementById('resign-alert').classList.add('hidden');
+            }
+
+            const qMonth = query(collection(db, "monthly_records"), where("empId", "==", id));
+            const snapMonth = await getDocs(qMonth);
+            monthlyRecords = [];
+            snapMonth.forEach(d => monthlyRecords.push(d.data()));
+
+            const qLedger = query(collection(db, "leave_ledger"), where("empId", "==", id));
+            unsubscribeLedger = onSnapshot(qLedger, (snap) => {
+                ledgerData = [];
+                snap.forEach(doc => ledgerData.push({ id: doc.id, ...doc.data() }));
+                ledgerData.sort((a, b) => dayjs(b.validFrom).unix() - dayjs(a.validFrom).unix());
+                renderLedger();
+            });
+
+            const qRecord = query(collection(db, "leave_records"), where("empId", "==", id));
+            unsubscribeUsage = onSnapshot(qRecord, (snap) => {
+                let records = [];
+                snap.forEach(doc => records.push({id: doc.id, ...doc.data()}));
+                records.sort((a, b) => dayjs(b.date).unix() - dayjs(a.date).unix());
+                renderUsageHistory(records);
+            });
+        }
+
+        // 5. 渲染存摺
+        function renderLedger() {
+            const container = document.getElementById('ledger-container');
+            container.innerHTML = "";
+            let totalRemaining = 0;
+            let totalExpired = 0;
+            const today = dayjs();
+
+            if (ledgerData.length === 0) {
+                container.innerHTML = `<div class="p-4 text-center text-slate-400 text-sm">尚無資料</div>`;
+            }
+
+            ledgerData.forEach(item => {
+                const expiry = dayjs(item.expiryDate);
+                const isExpired = expiry.isBefore(today);
+                const isExhausted = item.remaining <= 0;
+                
+                if (!isExhausted) {
+                    if (isExpired) totalExpired += item.remaining;
+                    else totalRemaining += item.remaining;
+                }
+
+                let statusHtml = "";
+                let rowClass = "hover:bg-slate-50";
+                
+                if (isExhausted) {
+                    statusHtml = `<span class="bg-gray-100 text-gray-400 text-xs px-2 py-1 rounded">已用完</span>`;
+                    rowClass = "bg-gray-50 opacity-60";
+                } else if (isExpired) {
+                    statusHtml = `<span class="bg-red-100 text-red-600 text-xs px-2 py-1 rounded">已過期</span>`;
+                } else {
+                    statusHtml = `<span class="bg-green-100 text-green-700 text-xs px-2 py-1 rounded">使用中</span>`;
+                }
+
+                let sourceBadge = '';
+                if (item.sourceType.includes("補休")) sourceBadge = '⚡ ';
+                else if (item.sourceType.includes("餘額")) sourceBadge = '📥 ';
+                else sourceBadge = '📅 ';
+
+                container.innerHTML += `
+                    <div class="grid grid-cols-12 gap-2 p-3 text-sm border-b items-center ${rowClass} group">
+                        <div class="col-span-3">
+                            <div class="font-bold text-slate-700 truncate" title="${item.sourceType}">${sourceBadge}${item.sourceType}</div>
+                            <div class="text-[10px] text-slate-400">${item.validFrom} 生效</div>
+                        </div>
+                        <div class="col-span-3 text-xs text-slate-500 flex flex-col justify-center">
+                            <span>效期至</span>
+                            <span class="font-mono text-slate-700 font-bold ${item.sourceType.includes('補休') ? 'text-orange-600' : ''}">${item.expiryDate}</span>
+                        </div>
+                        <div class="col-span-2 text-right text-slate-400 font-mono">${item.originalHours.toFixed(3)}</div>
+                        <div class="col-span-2 text-right font-bold text-blue-600 font-mono text-lg">${item.remaining.toFixed(3)}</div>
+                        <div class="col-span-2 text-right flex flex-col items-end gap-1">
+                            ${statusHtml}
+                            <button onclick="deleteLedgerItem('${item.id}')" class="text-[10px] text-red-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition">刪除</button>
+                        </div>
+                    </div>
+                `;
+            });
+
+            document.getElementById('big-balance').innerText = totalRemaining.toFixed(3);
+            
+            const expiredBox = document.getElementById('expired-section');
+            if (totalExpired > 0) {
+                expiredBox.classList.remove('hidden');
+                document.getElementById('expired-balance').innerText = totalExpired.toFixed(3);
+            } else {
+                expiredBox.classList.add('hidden');
+            }
+
+            if (currentEmpData.resignDate) {
+                document.getElementById('cash-out-hint').classList.remove('hidden');
+                document.getElementById('cash-out-hours').innerText = (totalRemaining + totalExpired).toFixed(3);
+            }
+        }
+
+        // 6. 彈窗
+        function openGrantModal(type) {
+            if (!currentEmpId) return;
+            currentGrantType = type;
+            const modal = document.getElementById('manual-grant-modal');
+            const title = document.getElementById('modal-title');
+            const dateLabel = document.getElementById('modal-date-label');
+            const dateInput = document.getElementById('mg-date'); 
+            const expiryInput = document.getElementById('mg-expiry'); 
+
+            modal.classList.remove('hidden');
+            document.getElementById('mg-hours').value = '';
+            
+            const today = dayjs().format('YYYY-MM-DD');
+            dateInput.value = today;
+
+            if (type === 'old_balance') {
+                title.innerHTML = '<span class="text-2xl">📥</span> 補入期初/舊制餘額';
+                dateLabel.innerText = "移轉基準日 (生效日)";
+                expiryInput.value = dayjs().add(1, 'year').format('YYYY-MM-DD');
+            } else if (type === 'comp_time') {
+                title.innerHTML = '<span class="text-2xl">⚡</span> 新增加班補休';
+                dateLabel.innerText = "加班日期 (生效日)";
+                expiryInput.value = dayjs().add(1, 'year').format('YYYY-MM-DD');
+            }
+        }
+
+        function closeManualModal() { document.getElementById('manual-grant-modal').classList.add('hidden'); }
+
+        async function submitManualGrant() {
+            const hoursStr = document.getElementById('mg-hours').value;
+            const dateStr = document.getElementById('mg-date').value;
+            const expiryStr = document.getElementById('mg-expiry').value;
+            
+            const hours = parseFloat(hoursStr);
+            if (isNaN(hours) || hours <= 0) return alert("請輸入有效時數");
+            if (!dateStr || !expiryStr) return alert("請完整填寫日期");
+
+            let sourceType = "";
+            if (currentGrantType === 'old_balance') sourceType = "期初移轉餘額";
+            else if (currentGrantType === 'comp_time') sourceType = `加班補休 (${dateStr})`;
+
+            try {
+                await addDoc(collection(db, "leave_ledger"), {
+                    empId: currentEmpId, sourceType, originalHours: hours, remaining: hours, validFrom: dateStr, expiryDate: expiryStr, createdAt: new Date().toISOString()
+                });
+                closeManualModal();
+            } catch(e) { console.error(e); alert("寫入失敗"); }
+        }
+
+        // 7. 折現彈窗
+        function openCashOutModal() {
+            if (!currentEmpId) return;
+            const expiredVal = parseFloat(document.getElementById('expired-balance').innerText) || 0;
+            const totalVal = parseFloat(document.getElementById('big-balance').innerText) || 0;
+            
+            if(expiredVal === 0 && totalVal === 0) return alert("無任何餘額可折現");
+
+            document.getElementById('cash-out-modal').classList.remove('hidden');
+            document.getElementById('co-date').value = dayjs().format('YYYY-MM-DD');
+            document.getElementById('co-hours').value = expiredVal > 0 ? expiredVal : totalVal;
+        }
+
+        function closeCashOutModal() { document.getElementById('cash-out-modal').classList.add('hidden'); }
+
+        async function submitCashOut() {
+            const date = document.getElementById('co-date').value;
+            const hours = parseFloat(document.getElementById('co-hours').value);
+            
+            if (!date || isNaN(hours) || hours <= 0) return alert("請輸入正確資料");
+
+            const today = dayjs();
+            let activeLedgers = ledgerData
+                .filter(l => l.remaining > 0) 
+                .sort((a, b) => {
+                    const diffExpiry = dayjs(a.expiryDate).unix() - dayjs(b.expiryDate).unix();
+                    if (diffExpiry !== 0) return diffExpiry;
+                    return dayjs(a.validFrom).unix() - dayjs(b.validFrom).unix();
+                });
+
+            const totalActive = activeLedgers.reduce((sum, l) => sum + l.remaining, 0);
+            if (totalActive < hours) return alert(`餘額不足 (含過期)！\n總共僅：${totalActive.toFixed(3)} H`);
+
+            const batch = writeBatch(db);
+            let remainingToDeduct = hours;
+            let deductionLog = [];
+
+            for (let ledger of activeLedgers) {
+                if (remainingToDeduct <= 0) break;
+                const deductAmount = Math.min(ledger.remaining, remainingToDeduct);
+                const newRemaining = ledger.remaining - deductAmount;
+
+                batch.update(doc(db, "leave_ledger", ledger.id), { remaining: newRemaining });
+                deductionLog.push({ ledgerId: ledger.id, source: ledger.sourceType, amount: deductAmount });
+                remainingToDeduct -= deductAmount;
+            }
+
+            batch.set(doc(collection(db, "leave_records")), {
+                empId: currentEmpId, date, 
+                type: 'cash_out', 
+                hours, 
+                note: '提早折現 / 離職結算', 
+                deductionLog,
+                createdAt: new Date().toISOString()
+            });
+
+            await batch.commit();
+            closeCashOutModal();
+            alert("折現作業完成！");
+        }
+
+        // 8. 自動試算
+        async function runAutoGrant() {
+            if (!currentEmpId) return;
+            const joinDate = dayjs(currentEmpData.joinDate);
+            const today = dayjs();
+            const batch = writeBatch(db);
+            let grantCount = 0;
+            let logMessage = "試算結果：\n";
+
+            const milestones = [0.5];
+            for(let i=1; i<=30; i++) milestones.push(i);
+
+            for (let year of milestones) {
+                let grantDate = year === 0.5 ? joinDate.add(6, 'month') : joinDate.add(year, 'year');
+                
+                if (grantDate.isBefore(today) || grantDate.isSame(today, 'day')) {
+                    const typeLabel = year === 0.5 ? "滿半年特休" : `滿 ${year} 年特休`;
+                    const grantDateStr = grantDate.format('YYYY-MM-DD');
+                    const exists = ledgerData.find(l => l.sourceType === typeLabel && l.validFrom === grantDateStr);
+
+                    if (!exists) {
+                        let hoursToGive = 0;
+                        if (currentRole === 'admin') {
+                            const days = getLegalDays(year);
+                            hoursToGive = days * 8;
+                        } else {
+                            let checkStart, checkEnd;
+                            if (year === 0.5) { checkStart = joinDate.startOf('month'); checkEnd = joinDate.add(6, 'month').endOf('month'); }
+                            else if (year === 1) { checkStart = joinDate.startOf('month'); checkEnd = joinDate.add(1, 'year').endOf('month'); }
+                            else { checkStart = joinDate.add(year - 1, 'year').startOf('month'); checkEnd = joinDate.add(year, 'year').subtract(1, 'month').endOf('month'); }
+
+                            const totalHours = sumHoursInPeriod(checkStart, checkEnd);
+                            const legalDays = getLegalDays(year);
+                            
+                            const denominator = year === 0.5 ? 1044 : 2088;
+                            hoursToGive = parseFloat(((totalHours / denominator) * legalDays * 8).toFixed(3));
+                        }
+
+                        if (hoursToGive > 0) {
+                            const newDocRef = doc(collection(db, "leave_ledger"));
+                            batch.set(newDocRef, {
+                                empId: currentEmpId, sourceType: typeLabel, originalHours: hoursToGive, remaining: hoursToGive, validFrom: grantDateStr,
+                                expiryDate: grantDate.add(2, 'year').format('YYYY-MM-DD'), createdAt: new Date().toISOString()
+                            });
+                            grantCount++;
+                            logMessage += `✅ ${typeLabel}: ${hoursToGive} 小時\n`;
+                        }
+                    }
+                }
+            }
+            if (grantCount > 0) { await batch.commit(); alert(logMessage); }
+            else { alert("目前沒有需要補發的特休。"); }
+        }
+
+        // 9. 請假扣除 (更新：增加假別對照與表格排版)
+        async function addUsageRecord() {
+            if (!currentEmpId) return;
+            const date = document.getElementById('rec-date').value;
+            const type = document.getElementById('rec-type').value;
+            const hours = parseFloat(document.getElementById('rec-hours').value);
+            const note = document.getElementById('rec-note').value;
+
+            if (!date || !hours || hours <= 0) return alert("請填寫正確資料");
+
+            if (type !== 'paid_leave') {
+                // 假別對照表
+                const typeMap = {
+                    'sick': '病假', 'personal': '事假', 'funeral': '喪假',
+                    'marriage': '婚假', 'maternity': '產假', 'paternity': '陪產假',
+                    'menstrual': '生理假', 'official': '公假', 'family': '家庭照顧假',
+                    'festival': '歲時祭儀假', 'injury': '公傷病假'
+                };
+                let displayType = typeMap[type] || type;
+
+                await addDoc(collection(db, "leave_records"), { empId: currentEmpId, date, type: displayType, hours, note, deductionLog: [], createdAt: new Date().toISOString() });
+                document.getElementById('rec-hours').value = "";
+                document.getElementById('rec-note').value = "";
+                return;
+            }
+
+            const today = dayjs();
+            let activeLedgers = ledgerData
+                .filter(l => dayjs(l.expiryDate).isAfter(today) && l.remaining > 0)
+                .sort((a, b) => {
+                    const diffExpiry = dayjs(a.expiryDate).unix() - dayjs(b.expiryDate).unix();
+                    if (diffExpiry !== 0) return diffExpiry;
+                    return dayjs(a.validFrom).unix() - dayjs(b.validFrom).unix();
+                });
+
+            const totalActive = activeLedgers.reduce((sum, l) => sum + l.remaining, 0);
+            
+            if (totalActive < hours) return alert(`有薪假餘額不足！\n可用：${totalActive.toFixed(3)} H\n欲請：${hours} H`);
+
+            const batch = writeBatch(db);
+            let remainingToDeduct = hours;
+            let deductionLog = [];
+
+            for (let ledger of activeLedgers) {
+                if (remainingToDeduct <= 0) break;
+                const deductAmount = Math.min(ledger.remaining, remainingToDeduct);
+                const newRemaining = ledger.remaining - deductAmount;
+                batch.update(doc(db, "leave_ledger", ledger.id), { remaining: newRemaining });
+                deductionLog.push({ ledgerId: ledger.id, source: ledger.sourceType, amount: deductAmount });
+                remainingToDeduct -= deductAmount;
+            }
+
+            batch.set(doc(collection(db, "leave_records")), {
+                empId: currentEmpId, date, type: '有薪假 (特休/補休)', hours, note, deductionLog, createdAt: new Date().toISOString()
+            });
+
+            await batch.commit();
+            document.getElementById('rec-hours').value = "";
+            document.getElementById('rec-note').value = "";
+        }
+
+        async function deleteLedgerItem(id) { if(confirm("確定刪除此紀錄？")) await deleteDoc(doc(db, "leave_ledger", id)); }
+
+        async function deleteUsageRecord(id, type, deductionLogJson) {
+            if (!confirm("刪除此紀錄？")) return;
+            const batch = writeBatch(db);
+            if ((type === '特休' || type.includes('有薪') || type === 'cash_out') && deductionLogJson) {
+                const logs = JSON.parse(deductionLogJson);
+                for(let log of logs) {
+                    const currentLedger = ledgerData.find(l => l.id === log.ledgerId);
+                    if(currentLedger) batch.update(doc(db, "leave_ledger", log.ledgerId), { remaining: currentLedger.remaining + log.amount });
+                }
+            }
+            batch.delete(doc(db, "leave_records", id));
+            await batch.commit();
+        }
+
+        function renderUsageHistory(records) {
+            const tbody = document.getElementById('history-list');
+            tbody.innerHTML = "";
+            records.forEach(r => {
+                const logStr = r.deductionLog ? JSON.stringify(r.deductionLog) : "";
+                let typeClass = "bg-gray-100 text-gray-600";
+                
+                if(r.type.includes('有薪')) typeClass = "bg-green-100 text-green-700";
+                else if(r.type === 'cash_out') typeClass = "bg-yellow-100 text-yellow-800 border border-yellow-300"; 
+                else if(r.type.includes('病') || r.type.includes('傷')) typeClass = "bg-orange-100 text-orange-700";
+
+                const typeLabel = r.type === 'cash_out' ? '💰 折現' : r.type;
+
+                tbody.innerHTML += `
+                    <tr class="border-b hover:bg-slate-50 text-sm">
+                        <td class="p-3 font-mono">${r.date}</td>
+                        <td class="p-3"><span class="px-2 py-1 rounded text-xs font-bold ${typeClass}">${typeLabel}</span></td>
+                        <td class="p-3 font-bold text-center">${r.hours}</td>
+                        <td class="p-3 text-slate-500 text-xs">${r.note||''}</td>
+                        <td class="p-3 text-center"><button onclick="deleteUsageRecord('${r.id}', '${r.type}', '${logStr.replace(/"/g, '&quot;')}')" class="text-red-400 hover:text-red-600 font-bold">×</button></td>
+                    </tr>`;
+            });
+        }
+
+        function getLegalDays(year) {
+            if (year === 0.5) return 3;
+            if (year >= 1 && year < 2) return 7;
+            if (year >= 2 && year < 3) return 10;
+            if (year >= 3 && year < 5) return 14;
+            if (year >= 5 && year < 10) return 15;
+            if (year >= 10) return 15 + Math.floor(year - 10);
+            return 0;
+        }
+
+        function sumHoursInPeriod(startDayjs, endDayjs) {
+            const startStr = startDayjs.format('YYYY-MM');
+            const endStr = endDayjs.format('YYYY-MM');
+            let total = 0;
+            monthlyRecords.forEach(r => {
+                if (r.yearMonth >= startStr && r.yearMonth <= endStr) total += (r.totalBaseHours || 0);
+            });
+            return total;
+        }
+
+        function calculateSeniority(joinDateStr) {
+            if(!joinDateStr) return { text: "-", years: 0 };
+            const diff = dayjs().diff(dayjs(joinDateStr), 'year', true);
+            return { text: `${Math.floor(diff)}年 ${Math.floor((diff%1)*365)}天`, years: diff };
+        }
+    </script>
+</head>
+<body class="h-screen flex flex-col p-6 overflow-hidden">
+
+    <div class="flex justify-between items-center mb-6 shrink-0">
+        <div>
+            <h1 class="text-2xl font-bold text-slate-800 flex items-center gap-2">📅 特休與補休管理系統</h1>
+        </div>
+        <div class="bg-white border rounded-lg flex shadow-sm">
+            <button id="btn-caregiver" onclick="switchRole('caregiver')" class="w-32 py-2 font-bold rounded-l-lg bg-blue-600 text-white transition">🏠 居服員</button>
+            <button id="btn-admin" onclick="switchRole('admin')" class="w-32 py-2 font-bold rounded-r-lg bg-white text-slate-600 transition hover:bg-slate-50">💼 行政</button>
+        </div>
+    </div>
+
+    <div class="flex-1 grid grid-cols-12 gap-6 min-h-0">
+        
+        <div class="col-span-3 bg-white rounded-2xl shadow-lg border border-slate-200 flex flex-col overflow-hidden">
+            <div class="p-3 bg-slate-50 border-b flex justify-between items-center">
+                <span class="font-bold text-slate-500 text-xs">員工列表</span>
+                <select onchange="filterStatus(this.value)" class="text-xs border rounded p-1 bg-white outline-none cursor-pointer hover:bg-slate-100">
+                    <option value="active">顯示在職</option>
+                    <option value="resigned">顯示離職</option>
+                    <option value="all">顯示全部</option>
+                </select>
+            </div>
+            <div id="emp-list" class="flex-1 overflow-y-auto"></div>
+        </div>
+
+        <div class="col-span-9 h-full relative">
+            <div id="empty-panel" class="absolute inset-0 flex flex-col items-center justify-center text-slate-400 bg-white/60 border-2 border-dashed border-slate-300 rounded-2xl">
+                <div class="text-4xl mb-2">👈</div>
+                <div>請選擇員工以檢視資料</div>
+            </div>
+
+            <div id="right-panel" class="hidden h-full flex flex-col gap-6">
+                <div class="bg-white p-5 rounded-2xl shadow-md border border-slate-200 flex justify-between items-start shrink-0">
+                    <div>
+                        <h2 class="text-3xl font-bold text-slate-800 flex items-center gap-3">
+                            <span id="header-name">---</span>
+                            <span id="resign-alert" class="hidden bg-red-100 text-red-600 text-sm px-2 py-1 rounded">⚠️ 已離職 (<span id="resign-date"></span>)</span>
+                        </h2>
+                        <div class="flex gap-4 mt-2 text-sm text-slate-500">
+                            <span>到職: <b id="header-join" class="text-slate-700">-</b></span>
+                            <span>年資: <b id="header-seniority" class="text-slate-700">-</b></span>
+                        </div>
+                    </div>
+                    <div class="text-right">
+                        <div class="text-xs font-bold text-slate-400 uppercase tracking-wider">Total Available</div>
+                        <div class="text-5xl font-black text-blue-600 tracking-tight" id="big-balance">0.000</div>
+                        <div class="text-xs text-slate-400 font-bold mt-1">可用總時數 (含遞延)</div>
+                        
+                        <div id="expired-section" class="mt-3 pt-2 border-t border-slate-100 hidden">
+                            <div class="text-2xl font-bold text-red-500" id="expired-balance">0.000</div>
+                            <div class="text-xs text-red-400 font-bold">待結算時數 (已過期)</div>
+                        </div>
+
+                        <div class="text-xs text-red-400 font-bold mt-1 hidden" id="cash-out-hint">離職應結算: <span id="cash-out-hours">0</span> H</div>
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-2 gap-6 min-h-0 flex-1">
+                    <div class="bg-white rounded-2xl shadow-lg border border-slate-200 flex flex-col overflow-hidden">
+                        <div class="p-3 bg-slate-50 border-b flex justify-between items-center">
+                            <h3 class="font-bold text-slate-700 flex items-center gap-2">📚 特休/補休存摺 (FIFO)</h3>
+                            <div class="flex gap-1">
+                                <button onclick="openCashOutModal()" class="bg-yellow-100 hover:bg-yellow-200 text-yellow-800 border border-yellow-300 px-2 py-1 rounded text-xs font-bold shadow-sm transition">💰 提早折現</button>
+                                <button onclick="openGrantModal('comp_time')" class="bg-orange-50 border border-orange-200 hover:bg-orange-100 text-orange-700 px-2 py-1 rounded text-xs font-bold shadow-sm transition">+ 新增加班補休</button>
+                                <button onclick="openGrantModal('old_balance')" class="bg-white border border-slate-300 hover:bg-slate-50 text-slate-600 px-2 py-1 rounded text-xs font-bold shadow-sm transition">+ 補入舊餘額</button>
+                                <button onclick="runAutoGrant()" class="bg-blue-600 hover:bg-blue-700 text-white px-2 py-1 rounded text-xs font-bold shadow flex items-center gap-1 transition">🤖 自動試算特休</button>
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-12 gap-2 p-2 bg-slate-100 text-xs text-slate-500 font-bold border-b">
+                            <div class="col-span-3">來源 / 生效</div>
+                            <div class="col-span-3">效期至</div>
+                            <div class="col-span-2 text-right">原始</div>
+                            <div class="col-span-2 text-right">剩餘</div>
+                            <div class="col-span-2 text-right">狀態</div>
+                        </div>
+                        <div id="ledger-container" class="flex-1 overflow-y-auto bg-white"></div>
+                    </div>
+
+                    <div class="bg-white rounded-2xl shadow-lg border border-slate-200 flex flex-col overflow-hidden">
+                        <div class="p-4 bg-slate-50 border-b" id="usage-form">
+                            <div class="flex gap-2 mb-2">
+                                <div class="flex-1"><label class="text-[10px] font-bold text-slate-400 block mb-1">日期</label><input type="date" id="rec-date" class="w-full border rounded px-2 py-1 text-sm font-bold text-slate-700"></div>
+                                <div class="w-32"><label class="text-[10px] font-bold text-slate-400 block mb-1">假別</label>
+                                    <select id="rec-type" class="w-full border rounded px-1 py-1 text-sm bg-white font-bold text-slate-700">
+                                        <option value="paid_leave">有薪假 (特休/補休)</option>
+                                        <option value="sick">病假</option>
+                                        <option value="personal">事假</option>
+                                        <option value="funeral">喪假</option>
+                                        <option value="marriage">婚假</option>
+                                        <option value="maternity">產假</option>
+                                        <option value="paternity">陪產檢及陪產假</option>
+                                        <option value="menstrual">生理假</option>
+                                        <option value="official">公假</option>
+                                        <option value="family">家庭照顧假</option>
+                                        <option value="festival">歲時祭儀假</option>
+                                        <option value="injury">公傷病假</option>
+                                    </select>
+                                </div>
+                                <div class="w-20"><label class="text-[10px] font-bold text-slate-400 block mb-1">時數</label><input type="number" id="rec-hours" class="w-full border rounded px-2 py-1 text-sm text-center font-bold" placeholder="4"></div>
+                            </div>
+                            <div class="flex gap-2">
+                                <input type="text" id="rec-note" class="flex-1 border rounded px-2 py-1 text-sm" placeholder="事由 (選填)">
+                                <button onclick="addUsageRecord()" class="bg-green-600 hover:bg-green-700 text-white px-4 rounded text-sm font-bold shadow">扣除</button>
+                            </div>
+                        </div>
+                        
+                        <div class="flex-1 overflow-y-auto bg-white">
+                            <table class="w-full text-sm text-left">
+                                <thead class="bg-slate-100 text-xs text-slate-500 font-bold sticky top-0">
+                                    <tr>
+                                        <th class="p-3 w-28">日期</th>
+                                        <th class="p-3 w-28">假別</th>
+                                        <th class="p-3 w-16 text-center">時數</th>
+                                        <th class="p-3">備註</th>
+                                        <th class="p-3 w-10"></th>
+                                    </tr>
+                                </thead>
+                                <tbody id="history-list" class="divide-y divide-slate-100">
+                                    </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="manual-grant-modal" class="hidden fixed inset-0 bg-black/50 z-50 flex items-center justify-center backdrop-blur-sm">
+        <div class="bg-white p-6 rounded-2xl shadow-2xl w-96 transform transition-all scale-100 border border-slate-200">
+            <h3 class="font-bold text-lg mb-4 text-slate-800 flex items-center gap-2" id="modal-title"></h3>
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-xs font-bold text-slate-500 mb-1" id="modal-date-label">生效日</label>
+                    <input type="date" id="mg-date" class="w-full border border-slate-300 rounded-lg p-2 font-bold text-slate-700 focus:ring-2 focus:ring-blue-500 outline-none">
+                </div>
+                <div>
+                    <label class="block text-xs font-bold text-slate-500 mb-1">補入時數</label>
+                    <input type="number" id="mg-hours" class="w-full border border-slate-300 rounded-lg p-2 font-bold text-xl text-blue-600 text-center focus:ring-2 focus:ring-blue-500 outline-none" placeholder="0.0">
+                </div>
+                <div>
+                    <label class="block text-xs font-bold text-slate-500 mb-1">有效期限 (到期日)</label>
+                    <input type="date" id="mg-expiry" class="w-full border border-slate-300 rounded-lg p-2 font-bold text-slate-700 focus:ring-2 focus:ring-blue-500 outline-none">
+                    <p class="text-[10px] text-orange-500 mt-1">* 系統扣除順序：先到期者先扣。</p>
+                </div>
+                <div class="flex gap-2 justify-end mt-6 pt-4 border-t border-slate-100">
+                    <button onclick="closeManualModal()" class="px-4 py-2 text-slate-500 hover:bg-slate-100 rounded-lg font-bold text-sm">取消</button>
+                    <button onclick="submitManualGrant()" class="px-6 py-2 bg-blue-600 text-white font-bold rounded-lg hover:bg-blue-700 shadow-md text-sm">確認</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div id="cash-out-modal" class="hidden fixed inset-0 bg-black/50 z-50 flex items-center justify-center backdrop-blur-sm">
+        <div class="bg-white p-6 rounded-2xl shadow-2xl w-96 transform transition-all scale-100 border border-yellow-200">
+            <h3 class="font-bold text-lg mb-4 text-yellow-800 flex items-center gap-2">
+                <span class="text-2xl">💰</span> 提早折現 / 結算
+            </h3>
+            <div class="space-y-4">
+                <div class="bg-yellow-50 p-3 rounded text-xs text-yellow-700">
+                    此操作將從存摺中扣除時數，並產生一筆「折現」紀錄供薪資系統讀取。
+                </div>
+                <div>
+                    <label class="block text-xs font-bold text-slate-500 mb-1">結算日期</label>
+                    <input type="date" id="co-date" class="w-full border border-slate-300 rounded-lg p-2 font-bold text-slate-700 focus:ring-2 focus:ring-yellow-500 outline-none">
+                </div>
+                <div>
+                    <label class="block text-xs font-bold text-slate-500 mb-1">折現時數</label>
+                    <input type="number" id="co-hours" class="w-full border border-slate-300 rounded-lg p-2 font-bold text-xl text-yellow-600 text-center focus:ring-2 focus:ring-yellow-500 outline-none">
+                </div>
+                <div class="flex gap-2 justify-end mt-6 pt-4 border-t border-slate-100">
+                    <button onclick="closeCashOutModal()" class="px-4 py-2 text-slate-500 hover:bg-slate-100 rounded-lg font-bold text-sm">取消</button>
+                    <button onclick="submitCashOut()" class="px-6 py-2 bg-yellow-500 text-white font-bold rounded-lg hover:bg-yellow-600 shadow-md text-sm">確認折現</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>

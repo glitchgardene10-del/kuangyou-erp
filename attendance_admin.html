@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>考勤與審核管理後台 (ERP整合核心)</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dayjs/1.11.10/dayjs.min.js"></script>
+    <style> 
+        body { font-family: 'Noto Sans TC', sans-serif; background-color: #f8fafc; } 
+        .nav-item { cursor: pointer; transition: all 0.2s; border-radius: 8px; margin-bottom: 4px; padding: 12px; color: #64748b; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+        .nav-item:hover { background-color: #f1f5f9; color: #334155; }
+        .nav-item.active { background-color: #e0f2fe; color: #0284c7; border-right: 4px solid #0284c7; }
+        
+        /* Iframe 與 內建區塊切換 */
+        #iframe-container { width: 100%; height: calc(100vh - 64px); background: #fff; }
+        #app-frame { width: 100%; height: 100%; border: none; }
+        
+        .sidebar-hidden { width: 0px !important; opacity: 0; pointer-events: none; }
+        #sidebar-panel { transition: width 0.3s ease-in-out; white-space: nowrap; overflow: hidden; }
+    </style>
+
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+        import { getFirestore, collection, addDoc, updateDoc, deleteDoc, doc, onSnapshot, query, orderBy, where, getDocs, writeBatch, getDoc, setDoc } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+
+        const firebaseConfig = {
+            apiKey: "AIzaSyDkC6kfqpmEeMKIvWIqftounTSH_NPp25M",
+            authDomain: "assessmentsystem-9e2ec.firebaseapp.com",
+            projectId: "assessmentsystem-9e2ec",
+            storageBucket: "assessmentsystem-9e2ec.firebasestorage.app",
+            messagingSenderId: "455151254122",
+            appId: "1:455151254122:web:45787cfce4469bff90e813",
+            measurementId: "G-201C6BE86Z"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+
+        let currentUser = null; 
+        let systemSettings = { allowedProxies: [], allowedEmployee: [], allowedLeave: [], allowedSalary: [], allowedAssessment: [], workStartTime: "08:30", workEndTime: "17:30", clockBuffer: 5 }; 
+        let allAdmins = []; let adminIds = new Set(); let allCaregivers = [];
+        let currentEditAttendanceId = null; let currentAttendanceData = [];
+
+        // 綁定全域函式
+        window.loginAs = loginAs;
+        window.toggleSidebar = toggleSidebar;
+        window.switchTab = switchTab;
+        window.openExternalSystem = openExternalSystem; // ★ 新增：切換到外部系統
+        
+        // 原有功能
+        window.processRequest = processRequest; 
+        window.saveSettings = saveSettings;
+        window.submitProxyRequest = submitProxyRequest;
+        window.changeAttendanceFilter = changeAttendanceFilter;
+        window.exportAttendance = exportAttendance;
+        window.openEditAttendance = openEditAttendance;
+        window.closeEditModal = closeEditModal;
+        window.submitEditAttendance = submitEditAttendance;
+        window.deleteAttendance = deleteAttendance;
+        window.openManualEntry = openManualEntry;
+        window.closeManualEntry = closeManualEntry;
+        window.submitManualEntry = submitManualEntry;
+
+        // 監聽系統設定
+        onSnapshot(doc(db, "system_settings", "config"), (docSnap) => {
+            if (docSnap.exists()) {
+                systemSettings = { ...systemSettings, ...docSnap.data() };
+                if(document.getElementById('work-start')) {
+                    document.getElementById('work-start').value = systemSettings.workStartTime;
+                    document.getElementById('work-end').value = systemSettings.workEndTime;
+                    document.getElementById('clock-buffer').value = systemSettings.clockBuffer;
+                }
+            }
+            if (currentUser) renderSidebar();
+            if (allAdmins.length > 0) renderPermissionTable();
+        });
+
+        // 載入員工 (用於登入選單)
+        const qEmp = query(collection(db, "employees"), orderBy("code"));
+        onSnapshot(qEmp, (snap) => {
+            const sel = document.getElementById('user-select');
+            const attFilter = document.getElementById('attendance-employee-filter');
+            
+            // 只有在還沒登入時才重繪登入選單，避免干擾
+            if(!currentUser) {
+                sel.innerHTML = '<option value="super_admin">👑 總管理員 (Super Admin)</option>';
+            }
+            
+            attFilter.innerHTML = '<option value="all">全體行政人員</option>';
+            allAdmins = []; allCaregivers = []; adminIds.clear();
+            
+            snap.forEach(doc => {
+                const e = { id: doc.id, ...doc.data() };
+                if (!e.resignDate) {
+                    if (e.role === 'admin') {
+                        allAdmins.push(e); adminIds.add(e.id);
+                        if(!currentUser) sel.innerHTML += `<option value="${e.id}" data-role="admin" data-name="${e.name}">👤 ${e.name}</option>`;
+                        attFilter.innerHTML += `<option value="${e.id}">${e.name}</option>`;
+                    } else { allCaregivers.push(e); }
+                }
+            });
+            renderPermissionTable(); renderCaregiverSelect();
+        });
+
+        function loginAs(select) {
+            const val = select.value;
+            if (val === 'super_admin') { currentUser = { id: 'super', name: '總管理員', role: 'super_admin' }; } 
+            else { const opt = select.options[select.selectedIndex]; currentUser = { id: val, name: opt.dataset.name, role: 'admin' }; }
+            
+            sessionStorage.setItem('kuangyou_user', JSON.stringify(currentUser));
+            document.getElementById('login-panel').classList.add('hidden');
+            document.getElementById('main-panel').classList.remove('hidden');
+            document.getElementById('current-user-name').innerText = currentUser.name;
+            renderSidebar();
+            
+            // 預設進入畫面
+            if(currentUser.role === 'super_admin') switchTab('approval');
+            else {
+                // 如果是一般行政，預設進入第一個有權限的功能，或個人打卡
+                switchTab('approval'); 
+            }
+        }
+
+        function toggleSidebar() {
+            const sidebar = document.getElementById('sidebar-panel');
+            sidebar.classList.toggle('sidebar-hidden');
+            sidebar.classList.toggle('w-64');
+        }
+
+        // ★ 重點：整合所有系統的側邊欄
+        function renderSidebar() {
+            const nav = document.getElementById('nav-menu');
+            nav.innerHTML = '';
+            
+            // 1. 內建功能 (Native DIVs)
+            nav.innerHTML += `<div class="px-4 py-2 text-xs font-bold text-slate-400 uppercase tracking-wider mt-2">簽核與監控</div>`;
+            
+            if (currentUser.role === 'super_admin') {
+                nav.innerHTML += `<div onclick="switchTab('approval')" id="nav-approval" class="nav-item"><span>✅</span> 待簽核清單 <span id="badge-count" class="bg-red-500 text-white text-[10px] px-2 rounded-full hidden">0</span></div>`;
+                nav.innerHTML += `<div onclick="switchTab('attendance')" id="nav-attendance" class="nav-item"><span>📊</span> 行政出勤監控</div>`;
+            }
+            if (hasPermission('allowedProxies')) { 
+                nav.innerHTML += `<div onclick="switchTab('proxy')" id="nav-proxy" class="nav-item"><span>📝</span> 居服員代申請</div>`; 
+            }
+            
+            // 2. 外部系統 (Iframe Modules)
+            nav.innerHTML += `<div class="px-4 py-2 text-xs font-bold text-slate-400 uppercase tracking-wider mt-4">ERP 核心系統</div>`;
+
+            if (hasPermission('allowedEmployee')) { 
+                nav.innerHTML += `<div onclick="openExternalSystem('employee.html', this)" class="nav-item"><span>👥</span> 員工資料庫</div>`; 
+            }
+            
+            if (hasPermission('allowedLeave')) { 
+                nav.innerHTML += `<div onclick="openExternalSystem('leave.html', this)" class="nav-item"><span>📚</span> 特休存摺管理</div>`; 
+            }
+
+            if (hasPermission('allowedSalary')) {
+                nav.innerHTML += `<div onclick="openExternalSystem('salary.html', this)" class="nav-item"><span>💰</span> 行政人員薪資</div>`;
+                nav.innerHTML += `<div onclick="openExternalSystem('salary_caregiver.html', this)" class="nav-item"><span>🏥</span> 居服員薪資</div>`;
+            }
+
+            if (hasPermission('allowedAssessment')) {
+                nav.innerHTML += `<div onclick="openExternalSystem('assessment.html', this)" class="nav-item"><span>📋</span> 考核評鑑系統</div>`;
+            }
+
+            // 3. 設定 (Native DIV)
+            if (currentUser.role === 'super_admin') { 
+                nav.innerHTML += `<div class="mt-auto border-t pt-2"><div onclick="switchTab('settings')" id="nav-settings" class="nav-item"><span>⚙️</span> 系統權限設定</div></div>`; 
+            }
+        }
+
+        function hasPermission(permKey) { 
+            if(!currentUser) return false; 
+            if(currentUser.role === 'super_admin') return true; 
+            return systemSettings[permKey]?.includes(currentUser.id); 
+        }
+        
+        // 切換到內建功能 (隱藏 Iframe)
+        function switchTab(tabId) {
+            // 隱藏所有 Iframe 與 Div
+            document.getElementById('iframe-container').classList.add('hidden');
+            document.querySelectorAll('.view-section').forEach(el => el.classList.add('hidden'));
+            document.getElementById('view-placeholder').classList.add('hidden');
+            
+            // 顯示目標 Div
+            const target = document.getElementById(`view-${tabId}`);
+            if(target) target.classList.remove('hidden');
+            
+            // 更新選單狀態
+            document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+            const activeNav = document.getElementById(`nav-${tabId}`);
+            if(activeNav) activeNav.classList.add('active');
+            
+            // 初始化特定功能
+            if(tabId === 'approval') loadPendingRequests();
+            if(tabId === 'attendance') { 
+                const currentMonth = dayjs().format('YYYY-MM'); 
+                document.getElementById('attendance-month').value = currentMonth; 
+                loadAttendanceStats(); 
+            }
+        }
+
+        // ★ 新增：切換到外部系統 (顯示 Iframe)
+        function openExternalSystem(url, element) {
+            // 隱藏所有 Div
+            document.querySelectorAll('.view-section').forEach(el => el.classList.add('hidden'));
+            document.getElementById('view-placeholder').classList.add('hidden');
+            
+            // 顯示 Iframe
+            const container = document.getElementById('iframe-container');
+            const frame = document.getElementById('app-frame');
+            container.classList.remove('hidden');
+            
+            // 載入網址 (避免重複載入)
+            if(frame.getAttribute('src') !== url) frame.src = url;
+            
+            // 更新選單狀態
+            document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+            if(element) element.classList.add('active');
+        }
+
+        // --- 以下為原有的內建功能邏輯 (保持不變) ---
+        function openManualEntry() { const sel = document.getElementById('manual-emp'); sel.innerHTML = '<option value="">-- 請選擇行政人員 --</option>'; allAdmins.forEach(admin => { sel.innerHTML += `<option value="${admin.id}">${admin.name}</option>`; }); document.getElementById('manual-date').value = dayjs().format('YYYY-MM-DD'); document.getElementById('manual-in').value = systemSettings.workStartTime || "08:30"; document.getElementById('manual-out').value = systemSettings.workEndTime || "17:30"; document.getElementById('manual-entry-modal').classList.remove('hidden'); }
+        function closeManualEntry() { document.getElementById('manual-entry-modal').classList.add('hidden'); }
+        async function submitManualEntry() { const empSel = document.getElementById('manual-emp'); const empId = empSel.value; const empName = empSel.options[empSel.selectedIndex]?.text; const date = document.getElementById('manual-date').value; const inTime = document.getElementById('manual-in').value; const outTime = document.getElementById('manual-out').value; if(!empId || !date) return alert("請選擇人員與日期"); try { await addDoc(collection(db, "attendance"), { empId: empId, name: empName, date: date, inTime: inTime || null, outTime: outTime || null, isManual: true, lastEditedBy: currentUser.name, timestamp: new Date().toISOString() }); alert("補登完成！"); closeManualEntry(); } catch(e) { console.error(e); alert("補登失敗"); } }
+        function renderPermissionTable() { const tbody = document.getElementById('permission-table-body'); tbody.innerHTML = ""; allAdmins.forEach(admin => { const pProxy = systemSettings.allowedProxies?.includes(admin.id) ? 'checked' : ''; const pEmp = systemSettings.allowedEmployee?.includes(admin.id) ? 'checked' : ''; const pLeave = systemSettings.allowedLeave?.includes(admin.id) ? 'checked' : ''; const pSalary = systemSettings.allowedSalary?.includes(admin.id) ? 'checked' : ''; const pAssess = systemSettings.allowedAssessment?.includes(admin.id) ? 'checked' : ''; tbody.innerHTML += `<tr class="border-b hover:bg-slate-50"><td class="p-3 font-bold text-slate-700">${admin.name}</td><td class="p-3 text-center"><input type="checkbox" class="w-5 h-5 perm-chk" data-type="allowedProxies" value="${admin.id}" ${pProxy}></td><td class="p-3 text-center"><input type="checkbox" class="w-5 h-5 perm-chk" data-type="allowedEmployee" value="${admin.id}" ${pEmp}></td><td class="p-3 text-center"><input type="checkbox" class="w-5 h-5 perm-chk" data-type="allowedLeave" value="${admin.id}" ${pLeave}></td><td class="p-3 text-center"><input type="checkbox" class="w-5 h-5 perm-chk" data-type="allowedSalary" value="${admin.id}" ${pSalary}></td><td class="p-3 text-center"><input type="checkbox" class="w-5 h-5 perm-chk" data-type="allowedAssessment" value="${admin.id}" ${pAssess}></td></tr>`; }); }
+        async function saveSettings() { const newPermissions = { allowedProxies: [], allowedEmployee: [], allowedLeave: [], allowedSalary: [], allowedAssessment: [] }; document.querySelectorAll('.perm-chk:checked').forEach(chk => { const type = chk.dataset.type; const uid = chk.value; if(newPermissions[type]) newPermissions[type].push(uid); }); const workStart = document.getElementById('work-start').value; const workEnd = document.getElementById('work-end').value; const clockBuffer = Number(document.getElementById('clock-buffer').value); try { await setDoc(doc(db, "system_settings", "config"), { ...newPermissions, workStartTime: workStart, workEndTime: workEnd, clockBuffer: clockBuffer, updatedAt: new Date().toISOString() }, { merge: true }); alert("設定已儲存！"); } catch(e) { console.error(e); alert("儲存失敗"); } }
+        function loadPendingRequests(){const q=query(collection(db,"requests"),where("status","==","pending"));onSnapshot(q,(snap)=>{const list=document.getElementById('approval-list');list.innerHTML="";const count=snap.size;const badge=document.getElementById('badge-count');if(badge){badge.innerText=count;badge.classList.toggle('hidden',count===0)}let requests=[];snap.forEach(doc=>requests.push({id:doc.id,...doc.data()}));requests.sort((a,b)=>dayjs(b.createdAt).unix()-dayjs(a.createdAt).unix());if(requests.length===0){list.innerHTML=`<div class="text-center text-slate-400 py-10">目前沒有待審核的單據</div>`;return}requests.forEach(r=>{let typeBadge=r.category==='leave'?`<span class="bg-blue-100 text-blue-700 px-2 py-1 rounded text-xs font-bold">請假-${r.type}</span>`:`<span class="bg-orange-100 text-orange-700 px-2 py-1 rounded text-xs font-bold">加班申請</span>`;list.innerHTML+=`<div class="bg-white p-4 rounded-xl shadow-sm border border-slate-200 mb-3 flex justify-between items-center"><div><div class="flex items-center gap-2 mb-1"><span class="font-bold text-lg text-slate-800">${r.name}</span>${typeBadge}</div><div class="text-sm text-slate-500">日期：<span class="font-bold text-slate-700">${r.date}</span> | 時數：<span class="font-bold text-slate-700">${r.hours} H</span></div><div class="text-xs text-slate-400 mt-1">事由：${r.note||'無'}</div></div><div class="flex gap-2"><button onclick="processRequest('${r.id}','rejected')" class="px-4 py-2 border border-red-200 text-red-600 rounded-lg hover:bg-red-50 text-sm font-bold transition">駁回</button><button onclick="processRequest('${r.id}','approved')" class="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 text-sm font-bold shadow transition">核准</button></div></div>`})})}
+        async function processRequest(reqId,action){let rejectReason="";if(action==='rejected'){rejectReason=prompt("請輸入駁回原因：","資料不全 / 試算有誤");if(rejectReason===null)return;if(rejectReason.trim()==="")rejectReason="未填寫原因"}else{if(!confirm(`確定要核准此申請嗎？`))return}const reqRef=doc(db,"requests",reqId);const reqSnap=await getDoc(reqRef);const reqData=reqSnap.data();const batch=writeBatch(db);batch.update(reqRef,{status:action,reviewedAt:new Date().toISOString(),rejectReason:rejectReason});if(action==='approved'){if(reqData.category==='overtime'){const ledgerRef=doc(collection(db,"leave_ledger"));batch.set(ledgerRef,{empId:reqData.empId,sourceType:`加班補休 (${reqData.date})`,originalHours:reqData.hours,remaining:reqData.hours,validFrom:reqData.date,expiryDate:dayjs(reqData.date).add(1,'year').format('YYYY-MM-DD'),createdAt:new Date().toISOString()})}else if(reqData.category==='leave'&&(reqData.type==='特休'||reqData.type==='補休')){const qLedger=query(collection(db,"leave_ledger"),where("empId","==",reqData.empId));const ledgerSnap=await getDocs(qLedger);let ledgers=[];ledgerSnap.forEach(d=>ledgers.push({id:d.id,...d.data()}));ledgers=ledgers.filter(l=>l.remaining>0&&dayjs(l.expiryDate).isAfter(dayjs())).sort((a,b)=>dayjs(a.expiryDate).unix()-dayjs(b.expiryDate).unix());let remainingToDeduct=reqData.hours;let deductionLog=[];for(let l of ledgers){if(remainingToDeduct<=0)break;const deduct=Math.min(l.remaining,remainingToDeduct);batch.update(doc(db,"leave_ledger",l.id),{remaining:l.remaining-deduct});deductionLog.push({ledgerId:l.id,source:l.sourceType,amount:deduct});remainingToDeduct-=deduct}if(remainingToDeduct>0)return alert("⚠️ 餘額不足");const recRef=doc(collection(db,"leave_records"));batch.set(recRef,{empId:reqData.empId,date:reqData.date,type:reqData.type,hours:reqData.hours,note:reqData.note,deductionLog:deductionLog,createdAt:new Date().toISOString()})}else{const recRef=doc(collection(db,"leave_records"));batch.set(recRef,{empId:reqData.empId,date:reqData.date,type:reqData.type,hours:reqData.hours,note:reqData.note,deductionLog:[],createdAt:new Date().toISOString()})} }try{await batch.commit()}catch(e){console.error(e);alert("操作失敗")}}
+        function changeAttendanceFilter(){loadAttendanceStats()}
+        function loadAttendanceStats(){const monthStr=document.getElementById('attendance-month').value;const targetEmpId=document.getElementById('attendance-employee-filter').value;if(!monthStr)return;const startStr=monthStr+"-01";const endStr=dayjs(monthStr).endOf('month').format('YYYY-MM-DD');let conditions=[where("date",">=",startStr),where("date","<=",endStr)];if(targetEmpId!=='all')conditions.push(where("empId","==",targetEmpId));const q=query(collection(db,"attendance"),...conditions);onSnapshot(q,(snap)=>{const list=document.getElementById('attendance-list');list.innerHTML="";currentAttendanceData=[];snap.forEach(doc=>{const r={id:doc.id,...doc.data()};if(adminIds.has(r.empId))currentAttendanceData.push(r)});currentAttendanceData.sort((a,b)=>a.date.localeCompare(b.date));if(currentAttendanceData.length===0){list.innerHTML=`<tr><td colspan="5" class="p-8 text-center text-slate-400">尚無行政人員打卡紀錄</td></tr>`;return}currentAttendanceData.forEach(r=>{const isLate=r.inTime>"08:35";const status=isLate?`<span class="text-red-500 font-bold">遲到</span>`:`<span class="text-green-600 font-bold">正常</span>`;let actionBtns=`<button onclick="openEditAttendance('${r.id}','${r.inTime||''}','${r.outTime||''}')" class="text-xs bg-slate-100 hover:bg-blue-100 text-slate-500 hover:text-blue-600 px-2 py-1 rounded transition mr-1">✏️</button><button onclick="deleteAttendance('${r.id}')" class="text-xs bg-slate-100 hover:bg-red-100 text-slate-500 hover:text-red-600 px-2 py-1 rounded transition">🗑️</button>`;list.innerHTML+=`<tr class="border-b hover:bg-slate-50"><td class="p-3"><div class="font-bold text-slate-700">${r.date}</div><div class="text-xs text-slate-400">${r.name}</div></td><td class="p-3 text-center font-mono">${r.inTime||'-'}</td><td class="p-3 text-center font-mono">${r.outTime||'-'}</td><td class="p-3 text-center">${status}</td><td class="p-3 text-center">${actionBtns}</td></tr>`})})}
+        function exportAttendance(){if(currentAttendanceData.length===0)return alert("無資料可匯出");let csvContent="\uFEFF日期,姓名,簽到時間,簽退時間,狀態\n";currentAttendanceData.forEach(r=>{const status=(r.inTime>"08:35")?"遲到":"正常";csvContent+=`${r.date},${r.name},${r.inTime||''},${r.outTime||''},${status}\n`});const url=URL.createObjectURL(new Blob([csvContent],{type:"text/csv;charset=utf-8;"}));const link=document.createElement("a");link.href=url;link.download=`考勤紀錄_${dayjs().format('YYYYMMDD')}.csv`;link.click()}
+        async function deleteAttendance(id){if(confirm("確定刪除此紀錄？"))await deleteDoc(doc(db,"attendance",id))}
+        function openEditAttendance(id,i,o){currentEditAttendanceId=id;document.getElementById('edit-modal').classList.remove('hidden');document.getElementById('edit-in').value=i;document.getElementById('edit-out').value=o}
+        function closeEditModal(){document.getElementById('edit-modal').classList.add('hidden')}
+        async function submitEditAttendance(){if(!currentEditAttendanceId)return;await updateDoc(doc(db,"attendance",currentEditAttendanceId),{inTime:document.getElementById('edit-in').value||null,outTime:document.getElementById('edit-out').value||null,lastEditedBy:currentUser.name,lastEditedAt:new Date().toISOString()});closeEditModal()}
+        function renderCaregiverSelect(){const sel=document.getElementById('proxy-caregiver');sel.innerHTML='<option value="">請選擇居服員</option>';allCaregivers.forEach(c=>{sel.innerHTML+=`<option value="${c.id}" data-name="${c.name}">${c.name} (${c.code})</option>`})}
+        async function submitProxyRequest(){const sel=document.getElementById('proxy-caregiver');const empId=sel.value;const empName=sel.options[sel.selectedIndex]?.dataset.name;const date=document.getElementById('proxy-date').value;const type=document.getElementById('proxy-type').value;const hours=document.getElementById('proxy-hours').value;if(!empId||!date||!hours)return alert("請填寫完整");await addDoc(collection(db,"requests"),{empId,name:empName,category:"leave",type,date,hours:Number(hours),createdBy:currentUser.id,note:`由 ${currentUser.name} 代申請`,status:"pending",createdAt:new Date().toISOString()});alert("代申請已送出！");document.getElementById('proxy-hours').value=""}
+    </script>
+</head>
+<body class="flex flex-col h-screen overflow-hidden">
+
+    <div id="login-panel" class="absolute inset-0 bg-slate-800 z-50 flex flex-col items-center justify-center">
+        <div class="bg-white p-8 rounded-2xl w-96 shadow-2xl text-center">
+            <h1 class="text-2xl font-bold text-slate-800 mb-6">後台管理登入</h1>
+            <select id="user-select" class="w-full p-3 border rounded-lg mb-4 font-bold bg-slate-50 text-lg"><option>載入中...</option></select>
+            <button onclick="loginAs(document.getElementById('user-select'))" class="w-full bg-slate-900 text-white py-3 rounded-lg font-bold hover:bg-slate-800 transition">進入後台</button>
+        </div>
+    </div>
+
+    <div id="main-panel" class="flex h-full hidden">
+        <div id="sidebar-panel" class="w-64 bg-white border-r border-slate-200 flex flex-col shrink-0 z-20 overflow-hidden">
+            <div class="p-6 border-b border-slate-100">
+                <h2 class="text-xl font-black text-slate-800 tracking-tight">管理中心</h2>
+                <div class="text-xs text-slate-400 mt-1">Hello, <span id="current-user-name" class="font-bold text-blue-600">---</span></div>
+            </div>
+            <div id="nav-menu" class="flex-1 flex flex-col py-4 overflow-y-auto"></div>
+            <div class="p-4 border-t"><button onclick="location.reload()" class="w-full py-2 text-slate-400 hover:text-slate-600 text-sm font-bold">登出系統</button></div>
+        </div>
+
+        <div class="flex-1 bg-slate-50 relative overflow-hidden flex flex-col">
+            <div class="bg-white border-b p-3 flex items-center shadow-sm z-10">
+                <button onclick="toggleSidebar()" class="mr-4 p-2 text-slate-500 hover:bg-slate-100 rounded-lg focus:outline-none">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" />
+                    </svg>
+                </button>
+                <h2 class="text-lg font-bold text-slate-700" id="page-title">儀表板</h2>
+            </div>
+
+            <div id="iframe-container" class="w-full h-full hidden"><iframe id="app-frame" src=""></iframe></div>
+
+            <div id="view-placeholder" class="view-section h-full flex flex-col items-center justify-center hidden"><div class="text-6xl mb-4">🔒</div><div class="text-slate-400 font-bold">您目前無任何後台管理權限</div></div>
+            
+            <div id="view-approval" class="view-section h-full flex flex-col p-8 hidden"><h2 class="text-2xl font-bold text-slate-800 mb-6">待簽核清單</h2><div id="approval-list" class="flex-1 overflow-y-auto pr-2 pb-20"></div></div>
+            
+            <div id="view-attendance" class="view-section h-full flex flex-col p-8 hidden">
+                <div class="flex flex-wrap gap-4 justify-between items-center mb-6">
+                    <div class="flex items-center gap-2"><h2 class="text-2xl font-bold text-slate-800 mr-2">行政出勤監控</h2><input type="month" id="attendance-month" class="border rounded-lg p-2 text-sm font-bold text-slate-600 bg-white shadow-sm" onchange="changeAttendanceFilter()"><select id="attendance-employee-filter" class="border rounded-lg p-2 text-sm font-bold text-slate-600 bg-white shadow-sm max-w-xs" onchange="changeAttendanceFilter()"></select></div>
+                    <div class="flex gap-2"><button onclick="openManualEntry()" class="bg-emerald-600 hover:bg-emerald-700 text-white px-3 py-2 rounded-lg text-sm font-bold shadow flex items-center gap-2"><span>➕</span> 補登</button><button onclick="exportAttendance()" class="bg-blue-600 hover:bg-blue-700 text-white px-3 py-2 rounded-lg text-sm font-bold shadow flex items-center gap-2"><span>🖨️</span> 匯出報表</button></div>
+                </div>
+                <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden flex-1 overflow-y-auto"><table class="w-full text-left relative"><thead class="bg-slate-100 text-slate-500 font-bold text-sm sticky top-0 z-10 shadow-sm"><tr><th class="p-4">日期 / 姓名</th><th class="p-4 text-center">簽到</th><th class="p-4 text-center">簽退</th><th class="p-4 text-center">狀態</th><th class="p-4 text-center">操作</th></tr></thead><tbody id="attendance-list" class="divide-y divide-slate-100 text-sm"></tbody></table></div>
+            </div>
+            
+            <div id="view-proxy" class="view-section h-full flex flex-col p-8 hidden">
+                <h2 class="text-2xl font-bold text-slate-800 mb-6">居服員休假代申請</h2>
+                <div class="bg-white p-8 rounded-2xl shadow-sm border border-slate-200 max-w-2xl">
+                    <div class="grid grid-cols-2 gap-6 mb-6">
+                        <div class="col-span-2"><label class="block text-sm font-bold text-slate-500 mb-2">選擇居服員</label><select id="proxy-caregiver" class="w-full border rounded-lg p-3 bg-slate-50 font-bold text-slate-700"></select></div>
+                        <div><label class="block text-sm font-bold text-slate-500 mb-2">日期</label><input type="date" id="proxy-date" class="w-full border rounded-lg p-3"></div>
+                        <div><label class="block text-sm font-bold text-slate-500 mb-2">假別</label><select id="proxy-type" class="w-full border rounded-lg p-3 bg-white"><option value="特休">特休</option><option value="補休">補休</option><option value="病假">病假</option><option value="事假">事假</option><option value="婚假">婚假</option><option value="喪假">喪假</option><option value="公假">公假</option><option value="產假">產假</option><option value="陪產假">陪產假</option><option value="生理假">生理假</option><option value="家庭照顧假">家庭照顧假</option><option value="歲時祭儀假">歲時祭儀假</option></select></div>
+                        <div><label class="block text-sm font-bold text-slate-500 mb-2">時數</label><input type="number" id="proxy-hours" class="w-full border rounded-lg p-3" placeholder="4.0"></div>
+                    </div>
+                    <button onclick="submitProxyRequest()" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 rounded-xl shadow-lg transition">送出申請</button>
+                </div>
+            </div>
+            
+            <div id="view-settings" class="view-section h-full flex flex-col p-8 hidden">
+                <h2 class="text-2xl font-bold text-slate-800 mb-6">系統設定</h2>
+                <div class="grid grid-cols-2 gap-8"><div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200"><h3 class="font-bold text-lg text-slate-700 mb-4 border-b pb-2">🔑 系統權限分配表</h3><div class="overflow-x-auto"><table class="w-full text-sm text-left"><thead class="bg-slate-100 text-slate-600 uppercase font-bold text-xs"><tr><th class="p-3">行政人員</th><th class="p-3 text-center">📝 代申請</th><th class="p-3 text-center">👥 員工資料</th><th class="p-3 text-center">📚 特休存摺</th><th class="p-3 text-center">💰 薪資系統</th><th class="p-3 text-center">📋 考核系統</th></tr></thead><tbody id="permission-table-body"></tbody></table></div></div><div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 max-w-2xl"><h3 class="font-bold text-lg text-slate-700 mb-4 border-b pb-2">⏰ 考勤規則設定</h3><div class="grid grid-cols-2 gap-6"><div><label class="block text-sm font-bold text-slate-500 mb-1">標準上班時間</label><input type="time" id="work-start" class="w-full border rounded p-2 text-slate-700 font-bold" value="08:30"></div><div><label class="block text-sm font-bold text-slate-500 mb-1">標準下班時間</label><input type="time" id="work-end" class="w-full border rounded p-2 text-slate-700 font-bold" value="17:30"></div><div class="col-span-2"><label class="block text-sm font-bold text-slate-500 mb-1">打卡彈性緩衝 (分鐘)</label><div class="flex items-center gap-2"><input type="number" id="clock-buffer" class="w-24 border rounded p-2 text-center font-bold" value="5"><span class="text-xs text-slate-400">分鐘內不算遲到/早退</span></div></div></div></div></div>
+                <div class="mt-6"><button onclick="saveSettings()" class="bg-slate-800 hover:bg-slate-900 text-white font-bold py-3 px-8 rounded-xl shadow-lg transition">儲存所有設定</button></div>
+            </div>
+        </div>
+    </div>
+
+    <div id="edit-modal" class="hidden fixed inset-0 bg-black/50 z-50 flex items-center justify-center backdrop-blur-sm">
+        <div class="bg-white p-6 rounded-2xl shadow-2xl w-80 border border-slate-200">
+            <h3 class="font-bold text-lg mb-4 text-slate-800">✏️ 修正考勤紀錄</h3>
+            <div class="space-y-4">
+                <div><label class="block text-xs font-bold text-slate-500 mb-1">簽到時間</label><input type="time" id="edit-in" class="w-full border rounded p-2 text-center font-bold text-slate-700"></div>
+                <div><label class="block text-xs font-bold text-slate-500 mb-1">簽退時間</label><input type="time" id="edit-out" class="w-full border rounded p-2 text-center font-bold text-slate-700"></div>
+                <div class="flex gap-2 justify-end mt-6 pt-4 border-t border-slate-100"><button onclick="closeEditModal()" class="px-3 py-1 text-slate-500 font-bold text-sm">取消</button><button onclick="submitEditAttendance()" class="px-4 py-1 bg-blue-600 text-white font-bold rounded shadow-md text-sm">更新</button></div>
+            </div>
+        </div>
+    </div>
+
+    <div id="manual-entry-modal" class="hidden fixed inset-0 bg-black/50 z-50 flex items-center justify-center backdrop-blur-sm">
+        <div class="bg-white p-6 rounded-2xl shadow-2xl w-80 border border-slate-200">
+            <h3 class="font-bold text-lg mb-4 text-slate-800">➕ 補登打卡紀錄</h3>
+            <div class="space-y-4">
+                <div><label class="block text-xs font-bold text-slate-500 mb-1">行政人員</label><select id="manual-emp" class="w-full border rounded p-2 font-bold text-slate-700"></select></div>
+                <div><label class="block text-xs font-bold text-slate-500 mb-1">日期</label><input type="date" id="manual-date" class="w-full border rounded p-2 font-bold text-slate-700"></div>
+                <div><label class="block text-xs font-bold text-slate-500 mb-1">簽到時間</label><input type="time" id="manual-in" class="w-full border rounded p-2 text-center font-bold text-slate-700"></div>
+                <div><label class="block text-xs font-bold text-slate-500 mb-1">簽退時間</label><input type="time" id="manual-out" class="w-full border rounded p-2 text-center font-bold text-slate-700"></div>
+                <div class="flex gap-2 justify-end mt-6 pt-4 border-t border-slate-100"><button onclick="closeManualEntry()" class="px-3 py-1 text-slate-500 font-bold text-sm">取消</button><button onclick="submitManualEntry()" class="px-4 py-1 bg-emerald-600 text-white font-bold rounded shadow-md text-sm">確認補登</button></div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
