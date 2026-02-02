@@ -43,6 +43,11 @@
         const db = getFirestore(app);
         const auth = getAuth(app);
 
+        // ★★★ 設定區域：請在此填入 Webhook 網址 ★★★
+        // 如果是用 Discord，請直接貼上 Webhook URL
+        // 如果是用 Line，這需要配合 Google Apps Script (較複雜)，若為空則不發送
+        const NOTIFY_URL = "https://discord.com/api/webhooks/1467732362396831825/pvTBpfX-cMqlESWn2kfGEmSGMVkBTPLHKcnQrxw9FhLsopK-wUZ7PTvvXTN8hjByCKXP"; 
+
         let currentUser = null;
         let todayAttendance = null;
         let currentTab = 'my'; 
@@ -65,27 +70,38 @@
         window.switchLocation = switchLocation;
         window.checkPeriodAutoFill = checkPeriodAutoFill;
 
-        // 1. Auth 狀態監聽 (核心驗證邏輯)
+        // ★ 新增：發送通知函式
+        async function sendNotification(message) {
+            if (!NOTIFY_URL) return; // 沒設定網址就不動作
+            try {
+                // 預設使用 Discord 格式 (JSON)
+                await fetch(NOTIFY_URL, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ content: message })
+                });
+                console.log("🔔 通知已發送");
+            } catch (e) {
+                console.error("通知發送失敗", e);
+            }
+        }
+
         onAuthStateChanged(auth, async (user) => {
             if (user) {
-                // 登入成功，讀取 Firestore 員工資料
                 try {
                     const userDocRef = doc(db, "employees", user.uid);
                     const userSnap = await getDoc(userDocRef);
 
                     if (userSnap.exists()) {
                         const userData = userSnap.data();
-                        // 檢查是否離職
                         if (userData.resignDate) {
                             alert("⛔ 此帳號已離職");
                             await signOut(auth);
                             return;
                         }
-                        // 綁定 currentUser (ID 為 Auth UID)
                         currentUser = { id: user.uid, ...userData };
                         doLoginSuccess();
                     } else {
-                        // 防呆：Auth 有帳號但 Firestore 無資料
                         console.error("Firestore missing employee data for UID:", user.uid);
                         alert("帳號資料異常，請聯繫管理員 (Code: NoProfile)");
                         await signOut(auth);
@@ -95,14 +111,12 @@
                     alert("讀取使用者資料失敗");
                 }
             } else {
-                // 未登入狀態
                 currentUser = null;
                 document.getElementById('login-panel').classList.remove('hidden');
                 document.getElementById('main-panel').classList.add('hidden');
             }
         });
 
-        // 監聽系統設定 (無需登入即可監聽，但在 Security Rules 需設為 public read 或 auth read)
         onSnapshot(doc(db, "system_settings", "config"), (docSnap) => {
             if(docSnap.exists()) {
                 systemSettings = { ...systemSettings, ...docSnap.data() };
@@ -110,20 +124,13 @@
             }
         });
 
-        // 2. 登入動作
         async function loginAs() {
             const code = document.getElementById('login-code').value.trim();
             const pwd = document.getElementById('login-password').value.trim();
-            
             if(!code || !pwd) return alert("請輸入帳號密碼");
-
-            // 虛擬 Email 轉換策略
             const virtualEmail = `${code}@kuangyou.internal`;
-
             try {
-                // 使用 Firebase Auth 登入
                 await signInWithEmailAndPassword(auth, virtualEmail, pwd);
-                // 成功後會自動觸發 onAuthStateChanged，無需在此處理 UI
             } catch (error) {
                 console.error("Login failed:", error.code);
                 if (error.code === 'auth/invalid-credential' || error.code === 'auth/user-not-found' || error.code === 'auth/wrong-password') {
@@ -140,14 +147,11 @@
             document.getElementById('login-panel').classList.add('hidden');
             document.getElementById('main-panel').classList.remove('hidden');
             document.getElementById('welcome-name').innerText = currentUser.name;
-            
             checkPermissionAndTabs();
             loadBalances();      
             loadTodayLeaves(); 
             loadTodayAttendance();
             loadRequests();
-            
-            // 啟動時鐘更新
             if (!window.clockInterval) {
                 window.clockInterval = setInterval(updateClockUI, 1000);
             }
@@ -156,25 +160,19 @@
         async function logout() {
             if(confirm("確定要登出嗎？")) {
                 await signOut(auth);
-                // onAuthStateChanged 會處理 UI 切換
             }
         }
 
         function checkPermissionAndTabs() {
-            // 使用 Auth UID 比對
             const hasProxy = systemSettings.allowedProxies?.includes(currentUser.id);
             const proxyTab = document.getElementById('tab-proxy');
             if (hasProxy) proxyTab.classList.remove('hidden');
             else { proxyTab.classList.add('hidden'); if(currentTab === 'proxy') switchRequestTab('my'); }
         }
 
-// ★ 修正版：同時兼容「新 UID」與「舊員工編號」的存摺資料
         function loadBalances() {
-            // 建立查詢陣列：包含目前的 UID 以及員工編號 (Code)
             const searchIds = [currentUser.id];
             if (currentUser.code) searchIds.push(currentUser.code);
-
-            // 使用 'in' 運算符同時搜尋
             const q = query(collection(db, "leave_ledger"), where("empId", "in", searchIds));
             
             onSnapshot(q, (snap) => {
@@ -182,12 +180,8 @@
                 let comp = 0;   
                 snap.forEach(doc => {
                     const d = doc.data();
-                    
-                    // 1. 過濾已過期的資料 (嚴謹判斷)
                     const expiry = d.expiryDate ? dayjs(d.expiryDate) : null;
-                    const isExpired = expiry && expiry.isBefore(dayjs(), 'day'); // 過期日早於今天
-
-                    // 2. 只加總「未過期」且「剩餘大於 0」的項目
+                    const isExpired = expiry && expiry.isBefore(dayjs(), 'day');
                     if(d.remaining > 0 && !isExpired) {
                         if(d.sourceType && d.sourceType.includes("補休")) {
                             comp += d.remaining;
@@ -196,12 +190,11 @@
                         }
                     }
                 });
-                
-                // 顯示結果 (取小數點 1 位比較美觀)
                 document.getElementById('bal-annual').innerText = parseFloat(annual.toFixed(1)) + " H";
                 document.getElementById('bal-comp').innerText = parseFloat(comp.toFixed(1)) + " H";
             });
         }
+
         function loadTodayLeaves() {
             const today = dayjs().format('YYYY-MM-DD');
             const q = query(collection(db, "requests"), 
@@ -259,7 +252,6 @@
             const startLimit = dayjs(`${todayStr} ${systemSettings.workStartTime}`).add(systemSettings.clockBuffer, 'minute');
             const endLimit = dayjs(`${todayStr} ${systemSettings.workEndTime}`);
 
-            // 白名單判定
             const exemptStart = todayLeaves.some(r => 
                 (r.status === 'approved' || r.status === 'pending') && 
                 (r.period === 'start' || r.period === 'full')
@@ -269,11 +261,9 @@
                 (r.period === 'end' || r.period === 'full')
             );
 
-            // 提示文字
             const startText = exemptStart ? `<div class="text-[10px] text-blue-200 mt-1">✨ 已申請請假 (允許打卡)</div>` : "";
             const endText = exemptEnd ? `<div class="text-[10px] text-blue-200 mt-1">✨ 已申請請假 (允許打卡)</div>` : "";
 
-            // 上班按鈕
             const inBtn = document.getElementById('btn-clock-in');
             if (todayAttendance && todayAttendance.inTime) {
                 inBtn.className = "p-4 rounded-2xl shadow-sm flex flex-col items-center justify-center gap-2 border-b-4 h-32 transition status-done";
@@ -291,7 +281,6 @@
                 }
             }
 
-            // 下班按鈕
             const outBtn = document.getElementById('btn-clock-out');
             if (todayAttendance && todayAttendance.outTime) {
                 outBtn.className = "p-4 rounded-2xl shadow-sm flex flex-col items-center justify-center gap-2 border-b-4 h-32 transition status-done";
@@ -324,12 +313,14 @@
         async function clockIn() {
             const loc = getLocationData(); if (!loc) return;
             const now = dayjs();
+            const timeStr = now.format('HH:mm');
             try { 
                 await addDoc(collection(db, "attendance"), { 
                     empId: currentUser.id, name: currentUser.name, date: now.format('YYYY-MM-DD'), 
-                    inTime: now.format('HH:mm'), outTime: null, location: loc, timestamp: new Date().toISOString() 
+                    inTime: timeStr, outTime: null, location: loc, timestamp: new Date().toISOString() 
                 }); 
                 alert(`✅ 上班打卡成功！\n地點：${loc}`); 
+                sendNotification(`🌞 [上班打卡] ${currentUser.name}\n時間：${timeStr}\n地點：${loc}`);
                 document.getElementById('location-note').value = ""; 
             } catch(e) { 
                 console.error(e);
@@ -340,11 +331,13 @@
         async function clockOut() { 
             const loc = getLocationData(); if (!loc) return;
             if(!todayAttendance) return alert("❌ 無上班紀錄，請申請補登。");
+            const timeStr = dayjs().format('HH:mm');
             try {
                 await updateDoc(doc(db, "attendance", todayAttendance.id), {
-                    outTime: dayjs().format('HH:mm'), locationOut: loc, updatedAt: new Date().toISOString()
+                    outTime: timeStr, locationOut: loc, updatedAt: new Date().toISOString()
                 });
                 alert(`✅ 下班打卡成功！\n地點：${loc}`);
+                sendNotification(`🌙 [下班打卡] ${currentUser.name}\n時間：${timeStr}\n地點：${loc}`);
                 document.getElementById('location-note').value = "";
             } catch(e) { 
                 console.error(e);
@@ -368,6 +361,7 @@
                     type, date, time, hours: 0, note: `逾時請求補登`, status: "pending", createdAt: new Date().toISOString(), createdBy: currentUser.id
                 });
                 alert("已送出申請");
+                sendNotification(`⚠️ [補登申請] ${currentUser.name}\n類型：${type}\n日期：${date} ${time}`);
             } catch(e) { alert("失敗"); }
         }
 
@@ -388,6 +382,7 @@
                     status: "pending", createdBy: currentUser.id, createdAt: new Date().toISOString() 
                 }); 
                 closeModal('modal-leave'); alert("已送出，請等待系統更新狀態後即可打卡。"); loadRequests(); 
+                sendNotification(`🌴 [請假申請] ${currentUser.name}\n假別：${type}\n日期：${date} (${hours}H)`);
             } catch(e) { alert("失敗"); }
         }
 
@@ -398,7 +393,14 @@
             if(!date || !hours) return alert("請填寫完整");
             if (hours % 0.5 !== 0) return alert("❌ 加班時數必須是 0.5 的倍數");
 
-            try { await addDoc(collection(db, "requests"), { empId: currentUser.id, name: currentUser.name, category: "overtime", date, hours, note, status: "pending", createdBy: currentUser.id, createdAt: new Date().toISOString() }); closeModal('modal-ot'); alert("已送出"); loadRequests(); } catch(e) { alert("失敗"); }
+            try { 
+                await addDoc(collection(db, "requests"), { 
+                    empId: currentUser.id, name: currentUser.name, category: "overtime", 
+                    date, hours, note, status: "pending", createdBy: currentUser.id, createdAt: new Date().toISOString() 
+                }); 
+                closeModal('modal-ot'); alert("已送出"); loadRequests(); 
+                sendNotification(`⚡ [加班申請] ${currentUser.name}\n日期：${date} (${hours}H)`);
+            } catch(e) { alert("失敗"); }
         }
 
         function switchRequestTab(tab) {
@@ -407,17 +409,14 @@
             document.getElementById('tab-proxy').className = tab === 'proxy' ? 'flex-1 text-center py-2 font-bold cursor-pointer tab-active' : 'flex-1 text-center py-2 font-bold cursor-pointer tab-inactive hover:bg-slate-100';
             loadRequests();
         }
-function loadRequests() {
-            // 同樣使用兼容查詢
+        function loadRequests() {
             const searchIds = [currentUser.id];
             if (currentUser.code) searchIds.push(currentUser.code);
 
             let q;
             if (currentTab === 'my') {
-                // 我的申請：查 empId 是 UID 或 Code 的
                 q = query(collection(db, "requests"), where("empId", "in", searchIds));
             } else {
-                // 代辦追蹤：查 createdBy 是 UID 或 Code 的
                 q = query(collection(db, "requests"), where("createdBy", "in", searchIds));
             }
 
@@ -427,7 +426,6 @@ function loadRequests() {
                 let records = []; 
                 snap.forEach(d => records.push({id: d.id, ...d.data()}));
                 
-                // 排序：新到舊
                 records.sort((a,b) => dayjs(b.createdAt).unix() - dayjs(a.createdAt).unix());
                 
                 if(records.length === 0) { 
