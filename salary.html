@@ -155,20 +155,25 @@
             };
 
             // ★ 修改：儲存時連同計算結果一起存入 (Accounting Ready)
+// ★★★ 修正版 handleSave：強制計算所有在職行政人員 ★★★
             const handleSave = async () => {
                 setLoading(true);
                 try {
-                    const dataToSave = { ...monthlyDataMap };
+                    // 1. 準備一個新的容器，不依賴 monthlyDataMap (因為新月份它是空的)
+                    const dataToSave = {}; 
                     
-                    Object.keys(dataToSave).forEach(empId => {
-                        const emp = employees.find(e => e.id === empId);
-                        if (emp) {
-                            // 1. 執行計算
-                            const result = calculatePayroll(emp, dataToSave[empId]);
-                            
-                            dataToSave[empId] = {
-                                ...dataToSave[empId],
-                                // 2. 更新參數快照 (Input)
+                    // 2. 遍歷「所有抓到的行政人員」，確保每個人都被算到
+                    employees.forEach(emp => {
+                        // 取得該員工目前的資料，如果沒改過就用預設值 (DEFAULT)
+                        const currentData = monthlyDataMap[emp.id] || DEFAULT_MONTHLY_DATA;
+                        
+                        // 執行薪資計算 (這一步最重要，會產生 grossSalary 等數據)
+                        const result = calculatePayroll(emp, currentData);
+                        
+                        if (result) {
+                            dataToSave[emp.id] = {
+                                ...currentData,
+                                // 建立快照 (Snapshot) - 鎖定當下費率
                                 snapshot: {
                                     baseSalary: emp.baseSalary,
                                     positionBonus: emp.positionBonus,
@@ -177,11 +182,12 @@
                                     healthIns: emp.healthIns,
                                     insuranceLevel: emp.insuranceLevel
                                 },
-                                // 3. ★ 新增：儲存計算結果 (Output)
+                                // ★★★ 建立會計歸檔結果 (Final Result) ★★★
+                                // 會計系統就是讀取這裡！
                                 finalResult: {
                                     grossSalary: result.grossSalary, // 應發
                                     netSalary: result.netSalary,     // 實領
-                                    employerPension: result.pensionCompany, // 公司提撥6%
+                                    employerPension: result.pensionCompany, // 公司提撥
                                     totalDeduction: result.deductRightTotal + result.deductLeftTotal, // 總扣款
                                     payDays: result.payDays,
                                     isProrated: result.isProrated,
@@ -191,9 +197,21 @@
                         }
                     });
 
+                    // 3. 檢查是否有算出資料
+                    if (Object.keys(dataToSave).length === 0) {
+                        alert("⚠️ 沒有有效的行政人員資料可儲存！(請確認員工名單是否已載入)");
+                        setLoading(false);
+                        return;
+                    }
+
+                    // 4. 寫入資料庫
                     await window.setDoc(window.doc(window.db, "salary_records_admin", currentMonth), dataToSave, { merge: true });
-                    alert("✅ 薪資資料已儲存 (含會計歸檔數據)");
-                } catch (e) { console.error(e); alert("儲存失敗"); }
+                    alert(`✅ 成功歸檔 ${Object.keys(dataToSave).length} 筆資料！\n\n資料庫已更新，現在可以去會計系統拋轉了。`);
+                    
+                } catch (e) { 
+                    console.error(e); 
+                    alert("儲存失敗：" + e.message); 
+                }
                 setLoading(false);
             };
 
