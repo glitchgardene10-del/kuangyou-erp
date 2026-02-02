@@ -163,11 +163,24 @@
                 allAdmins.sort((a, b) => (a.code || "").localeCompare(b.code || ""));
                 allCaregivers.sort((a, b) => (a.code || "").localeCompare(b.code || ""));
 
+                // --- 修正開始：填入各處下拉選單 ---
+                
+                // 1. 填入「考勤監控」上方的篩選器
                 const attFilter = document.getElementById('attendance-employee-filter');
                 if(attFilter) {
                     attFilter.innerHTML = '<option value="all">全體行政人員</option>';
                     allAdmins.forEach(e => attFilter.innerHTML += `<option value="${e.id}">${e.name}</option>`);
                 }
+
+                // 2. ★ 修正點：填入「補登視窗」的人員選單 (原本漏了這段)
+                const manualSel = document.getElementById('manual-emp');
+                if(manualSel) {
+                    manualSel.innerHTML = '<option value="">請選擇人員</option>';
+                    allAdmins.forEach(e => manualSel.innerHTML += `<option value="${e.id}">${e.name}</option>`);
+                }
+                
+                // --- 修正結束 ---
+
                 renderCaregiverSelect(); renderPermissionTable(); updateDashboardStats();
             } catch (e) { console.error("Load Data Error:", e); }
         }
