@@ -26,7 +26,8 @@
 
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
-        import { getFirestore, collection, addDoc, onSnapshot, query, where, deleteDoc, doc, getDocs, updateDoc } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+        import { getFirestore, collection, addDoc, onSnapshot, query, where, deleteDoc, doc, updateDoc, getDoc } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+        import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, signOut } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js";
 
         const firebaseConfig = {
             apiKey: "AIzaSyDkC6kfqpmEeMKIvWIqftounTSH_NPp25M",
@@ -40,21 +41,23 @@
 
         const app = initializeApp(firebaseConfig);
         const db = getFirestore(app);
+        const auth = getAuth(app);
 
         let currentUser = null;
         let todayAttendance = null;
         let currentTab = 'my'; 
         let systemSettings = { allowedProxies: [], workStartTime: "08:30", workEndTime: "17:30", clockBuffer: 5 };
-        let todayLeaves = []; // 白名單 (含審核中)
+        let todayLeaves = []; 
         let currentLocationType = 'office'; 
 
+        // 全域綁定
         window.loginAs = loginAs;
         window.logout = logout;
         window.clockIn = clockIn;
         window.clockOut = clockOut;
         window.sendCorrectionRequest = sendCorrectionRequest; 
-        window.openModal = openModal;
-        window.closeModal = closeModal;
+        window.openModal = (id) => document.getElementById(id).classList.remove('hidden');
+        window.closeModal = (id) => document.getElementById(id).classList.add('hidden');
         window.submitLeave = submitLeave;
         window.submitOvertime = submitOvertime;
         window.deleteRequest = deleteRequest;
@@ -62,15 +65,44 @@
         window.switchLocation = switchLocation;
         window.checkPeriodAutoFill = checkPeriodAutoFill;
 
-        // 1. 自動登入
-        (function() {
-            const localUser = localStorage.getItem('kuangyou_user_persistent');
-            if (localUser) {
-                try { currentUser = JSON.parse(localUser); setTimeout(() => doLoginSuccess(), 100); } 
-                catch(e) { localStorage.removeItem('kuangyou_user_persistent'); }
-            }
-        })();
+        // 1. Auth 狀態監聽 (核心驗證邏輯)
+        onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                // 登入成功，讀取 Firestore 員工資料
+                try {
+                    const userDocRef = doc(db, "employees", user.uid);
+                    const userSnap = await getDoc(userDocRef);
 
+                    if (userSnap.exists()) {
+                        const userData = userSnap.data();
+                        // 檢查是否離職
+                        if (userData.resignDate) {
+                            alert("⛔ 此帳號已離職");
+                            await signOut(auth);
+                            return;
+                        }
+                        // 綁定 currentUser (ID 為 Auth UID)
+                        currentUser = { id: user.uid, ...userData };
+                        doLoginSuccess();
+                    } else {
+                        // 防呆：Auth 有帳號但 Firestore 無資料
+                        console.error("Firestore missing employee data for UID:", user.uid);
+                        alert("帳號資料異常，請聯繫管理員 (Code: NoProfile)");
+                        await signOut(auth);
+                    }
+                } catch (error) {
+                    console.error("Error fetching user profile:", error);
+                    alert("讀取使用者資料失敗");
+                }
+            } else {
+                // 未登入狀態
+                currentUser = null;
+                document.getElementById('login-panel').classList.remove('hidden');
+                document.getElementById('main-panel').classList.add('hidden');
+            }
+        });
+
+        // 監聽系統設定 (無需登入即可監聽，但在 Security Rules 需設為 public read 或 auth read)
         onSnapshot(doc(db, "system_settings", "config"), (docSnap) => {
             if(docSnap.exists()) {
                 systemSettings = { ...systemSettings, ...docSnap.data() };
@@ -78,80 +110,100 @@
             }
         });
 
-        // 2. 登入
+        // 2. 登入動作
         async function loginAs() {
             const code = document.getElementById('login-code').value.trim();
             const pwd = document.getElementById('login-password').value.trim();
-            const remember = document.getElementById('remember-me').checked;
-
+            
             if(!code || !pwd) return alert("請輸入帳號密碼");
 
+            // 虛擬 Email 轉換策略
+            const virtualEmail = `${code}@kuangyou.internal`;
+
             try {
-                const q = query(collection(db, "employees"), where("code", "==", code));
-                const snapshot = await getDocs(q);
-                if (snapshot.empty) return alert("❌ 找不到此員工");
-                const userDoc = snapshot.docs[0];
-                const userData = userDoc.data();
-
-                if (userData.role !== 'admin') return alert("⛔ 權限不足");
-                if (userData.resignDate) return alert("⛔ 此帳號已離職");
-
-                if (userData.password === pwd) {
-                    currentUser = { id: userDoc.id, name: userData.name, role: userData.role };
-                    if (remember) localStorage.setItem('kuangyou_user_persistent', JSON.stringify(currentUser));
-                    else sessionStorage.setItem('kuangyou_user_temp', JSON.stringify(currentUser));
-                    doLoginSuccess();
-                } else { alert("❌ 密碼錯誤"); }
-            } catch (e) { alert("登入失敗"); }
+                // 使用 Firebase Auth 登入
+                await signInWithEmailAndPassword(auth, virtualEmail, pwd);
+                // 成功後會自動觸發 onAuthStateChanged，無需在此處理 UI
+            } catch (error) {
+                console.error("Login failed:", error.code);
+                if (error.code === 'auth/invalid-credential' || error.code === 'auth/user-not-found' || error.code === 'auth/wrong-password') {
+                    alert("❌ 帳號或密碼錯誤");
+                } else if (error.code === 'auth/too-many-requests') {
+                    alert("⚠️ 嘗試次數過多，請稍後再試");
+                } else {
+                    alert(`登入失敗 (${error.code})`);
+                }
+            }
         }
 
         function doLoginSuccess() {
             document.getElementById('login-panel').classList.add('hidden');
             document.getElementById('main-panel').classList.remove('hidden');
             document.getElementById('welcome-name').innerText = currentUser.name;
+            
             checkPermissionAndTabs();
             loadBalances();      
-            loadTodayLeaves(); // ★ 改名：讀取今日所有假單
+            loadTodayLeaves(); 
             loadTodayAttendance();
             loadRequests();
-            setInterval(updateClockUI, 1000);
+            
+            // 啟動時鐘更新
+            if (!window.clockInterval) {
+                window.clockInterval = setInterval(updateClockUI, 1000);
+            }
         }
 
-        function logout() {
+        async function logout() {
             if(confirm("確定要登出嗎？")) {
-                localStorage.removeItem('kuangyou_user_persistent');
-                location.reload();
+                await signOut(auth);
+                // onAuthStateChanged 會處理 UI 切換
             }
         }
 
         function checkPermissionAndTabs() {
+            // 使用 Auth UID 比對
             const hasProxy = systemSettings.allowedProxies?.includes(currentUser.id);
             const proxyTab = document.getElementById('tab-proxy');
             if (hasProxy) proxyTab.classList.remove('hidden');
             else { proxyTab.classList.add('hidden'); if(currentTab === 'proxy') switchRequestTab('my'); }
         }
 
+// ★ 修正版：同時兼容「新 UID」與「舊員工編號」的存摺資料
         function loadBalances() {
-            const q = query(collection(db, "leave_ledger"), where("empId", "==", currentUser.id));
+            // 建立查詢陣列：包含目前的 UID 以及員工編號 (Code)
+            const searchIds = [currentUser.id];
+            if (currentUser.code) searchIds.push(currentUser.code);
+
+            // 使用 'in' 運算符同時搜尋
+            const q = query(collection(db, "leave_ledger"), where("empId", "in", searchIds));
+            
             onSnapshot(q, (snap) => {
                 let annual = 0; 
                 let comp = 0;   
                 snap.forEach(doc => {
                     const d = doc.data();
-                    if(d.remaining > 0) {
-                        if(d.sourceType && d.sourceType.includes("補休")) comp += d.remaining;
-                        else annual += d.remaining; 
+                    
+                    // 1. 過濾已過期的資料 (嚴謹判斷)
+                    const expiry = d.expiryDate ? dayjs(d.expiryDate) : null;
+                    const isExpired = expiry && expiry.isBefore(dayjs(), 'day'); // 過期日早於今天
+
+                    // 2. 只加總「未過期」且「剩餘大於 0」的項目
+                    if(d.remaining > 0 && !isExpired) {
+                        if(d.sourceType && d.sourceType.includes("補休")) {
+                            comp += d.remaining;
+                        } else {
+                            annual += d.remaining; 
+                        }
                     }
                 });
-                document.getElementById('bal-annual').innerText = annual + " H";
-                document.getElementById('bal-comp').innerText = comp + " H";
+                
+                // 顯示結果 (取小數點 1 位比較美觀)
+                document.getElementById('bal-annual').innerText = parseFloat(annual.toFixed(1)) + " H";
+                document.getElementById('bal-comp').innerText = parseFloat(comp.toFixed(1)) + " H";
             });
         }
-
-        // ★ 修改：讀取今日假單 (含 Pending & Approved)
         function loadTodayLeaves() {
             const today = dayjs().format('YYYY-MM-DD');
-            // 移除 status 篩選，抓取所有類別為 leave 的單
             const q = query(collection(db, "requests"), 
                 where("empId", "==", currentUser.id), 
                 where("date", "==", today),
@@ -192,7 +244,6 @@
             }
         }
 
-        // 3. 打卡 UI 邏輯 (★ 修改：白名單包含 Pending)
         function loadTodayAttendance() {
             const todayStr = dayjs().format('YYYY-MM-DD');
             const q = query(collection(db, "attendance"), where("empId", "==", currentUser.id), where("date", "==", todayStr));
@@ -208,7 +259,7 @@
             const startLimit = dayjs(`${todayStr} ${systemSettings.workStartTime}`).add(systemSettings.clockBuffer, 'minute');
             const endLimit = dayjs(`${todayStr} ${systemSettings.workEndTime}`);
 
-            // ★ 修改：白名單判定 (接受 Approved 或 Pending)
+            // 白名單判定
             const exemptStart = todayLeaves.some(r => 
                 (r.status === 'approved' || r.status === 'pending') && 
                 (r.period === 'start' || r.period === 'full')
@@ -229,13 +280,11 @@
                 inBtn.innerHTML = `<span class="text-3xl grayscale">🌞</span><div class="font-bold text-slate-500">已簽到 ${todayAttendance.inTime}</div><div class="text-[10px] text-slate-400">${todayAttendance.location || '公司'}</div>`;
                 inBtn.onclick = null;
             } else {
-                // 遲到且無豁免 -> 補登
                 if (now.isAfter(startLimit) && !exemptStart) {
                     inBtn.className = "p-4 rounded-2xl shadow-md flex flex-col items-center justify-center gap-2 border-b-4 h-32 transition cursor-pointer status-late btn-press";
                     inBtn.innerHTML = `<span class="text-3xl">⚠️</span><span class="font-bold">申請補登</span><span class="text-[10px]">已過上班時間</span>`;
                     inBtn.onclick = () => sendCorrectionRequest('上班', todayStr, now.format('HH:mm'));
                 } else {
-                    // 正常 或 有豁免 -> 藍色打卡
                     inBtn.className = "bg-blue-500 p-4 rounded-2xl shadow-lg flex flex-col items-center justify-center gap-2 btn-press border-b-4 border-blue-700 h-32 cursor-pointer transition text-white";
                     inBtn.innerHTML = `<span class="text-4xl">🌞</span><span class="font-bold">上班打卡</span>${startText}`;
                     inBtn.onclick = clockIn;
@@ -249,7 +298,6 @@
                 outBtn.innerHTML = `<span class="text-3xl grayscale">🌙</span><div class="font-bold text-slate-500">已簽退 ${todayAttendance.outTime}</div><div class="text-[10px] text-slate-400">${todayAttendance.locationOut || todayAttendance.location || '公司'}</div>`;
                 outBtn.onclick = null;
             } else {
-                // 早退且無豁免 -> 補登
                 if (now.isBefore(endLimit) && !exemptEnd) {
                     outBtn.className = "p-4 rounded-2xl shadow-md flex flex-col items-center justify-center gap-2 border-b-4 h-32 transition cursor-pointer status-late btn-press";
                     outBtn.innerHTML = `<span class="text-3xl">⚠️</span><span class="font-bold">申請補登</span><span class="text-[10px]">尚未到下班時間</span>`;
@@ -283,7 +331,10 @@
                 }); 
                 alert(`✅ 上班打卡成功！\n地點：${loc}`); 
                 document.getElementById('location-note').value = ""; 
-            } catch(e) { alert("打卡失敗"); }
+            } catch(e) { 
+                console.error(e);
+                alert("打卡失敗：權限不足或網路錯誤"); 
+            }
         }
 
         async function clockOut() { 
@@ -295,7 +346,10 @@
                 });
                 alert(`✅ 下班打卡成功！\n地點：${loc}`);
                 document.getElementById('location-note').value = "";
-            } catch(e) { alert("簽退失敗"); }
+            } catch(e) { 
+                console.error(e);
+                alert("簽退失敗"); 
+            }
         }
 
         async function sendCorrectionRequest(type, date, time) {
@@ -353,26 +407,56 @@
             document.getElementById('tab-proxy').className = tab === 'proxy' ? 'flex-1 text-center py-2 font-bold cursor-pointer tab-active' : 'flex-1 text-center py-2 font-bold cursor-pointer tab-inactive hover:bg-slate-100';
             loadRequests();
         }
-        function loadRequests() {
-            let q = currentTab === 'my' ? query(collection(db, "requests"), where("empId", "==", currentUser.id)) : query(collection(db, "requests"), where("createdBy", "==", currentUser.id));
+function loadRequests() {
+            // 同樣使用兼容查詢
+            const searchIds = [currentUser.id];
+            if (currentUser.code) searchIds.push(currentUser.code);
+
+            let q;
+            if (currentTab === 'my') {
+                // 我的申請：查 empId 是 UID 或 Code 的
+                q = query(collection(db, "requests"), where("empId", "in", searchIds));
+            } else {
+                // 代辦追蹤：查 createdBy 是 UID 或 Code 的
+                q = query(collection(db, "requests"), where("createdBy", "in", searchIds));
+            }
+
             onSnapshot(q, (snap) => {
-                const list = document.getElementById('request-list'); list.innerHTML = "";
-                let records = []; snap.forEach(d => records.push({id: d.id, ...d.data()}));
-                records.sort((a,b)=>dayjs(b.createdAt).unix()-dayjs(a.createdAt).unix());
-                if(records.length===0) { list.innerHTML = `<div class="text-center text-gray-400 py-10 bg-white rounded-xl border border-dashed border-gray-300">尚無紀錄</div>`; return; }
+                const list = document.getElementById('request-list'); 
+                list.innerHTML = "";
+                let records = []; 
+                snap.forEach(d => records.push({id: d.id, ...d.data()}));
+                
+                // 排序：新到舊
+                records.sort((a,b) => dayjs(b.createdAt).unix() - dayjs(a.createdAt).unix());
+                
+                if(records.length === 0) { 
+                    list.innerHTML = `<div class="text-center text-gray-400 py-10 bg-white rounded-xl border border-dashed border-gray-300">尚無紀錄</div>`; 
+                    return; 
+                }
+                
                 records.forEach(r => {
                     let badge = r.status === 'pending' ? '⏳' : (r.status === 'approved' ? '✅' : '🚫');
                     let periodText = r.period === 'start' ? '(上班段)' : (r.period === 'end' ? '(下班段)' : (r.period === 'full' ? '(整日)' : ''));
                     let title = r.category === 'correction' ? `補登: ${r.type}` : (r.category === 'leave' ? `請假: ${r.type} ${periodText}` : '加班');
                     
-                    list.innerHTML += `<div class="p-4 rounded-xl shadow-sm border mb-3 bg-white"><div class="flex justify-between font-bold text-slate-800"><div>${title}</div><div>${badge}</div></div><div class="text-xs text-slate-500 mt-1">${r.date} ${r.time||''} / ${r.hours||0}H</div><div class="text-xs text-slate-400">${r.note||''}</div>${r.status==='rejected'?`<div class="text-xs text-red-500 mt-1 border-t pt-1">駁回: ${r.rejectReason}</div>`:''}<button onclick="deleteRequest('${r.id}')" class="text-red-300 text-xs mt-2 w-full text-right">刪除</button></div>`;
+                    list.innerHTML += `
+                        <div class="p-4 rounded-xl shadow-sm border mb-3 bg-white">
+                            <div class="flex justify-between font-bold text-slate-800"><div>${title}</div><div>${badge}</div></div>
+                            <div class="text-xs text-slate-500 mt-1">${r.date} ${r.time||''} / ${r.hours||0}H</div>
+                            <div class="text-xs text-slate-400">${r.note||''}</div>
+                            ${r.status==='rejected' ? `<div class="text-xs text-red-500 mt-1 border-t pt-1">駁回: ${r.rejectReason}</div>` : ''}
+                            <button onclick="deleteRequest('${r.id}')" class="text-red-300 text-xs mt-2 w-full text-right">刪除</button>
+                        </div>`;
                 });
             });
         }
         async function deleteRequest(id) { if(confirm("刪除？")) await deleteDoc(doc(db,"requests",id)); }
-        function openModal(id) { document.getElementById(id).classList.remove('hidden'); }
-        function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
-        setInterval(() => { document.getElementById('clock-display').innerText = dayjs().format('HH:mm:ss'); document.getElementById('date-display').innerText = dayjs().format('YYYY年MM月DD日 dddd'); }, 1000);
+        
+        setInterval(() => { 
+            document.getElementById('clock-display').innerText = dayjs().format('HH:mm:ss'); 
+            document.getElementById('date-display').innerText = dayjs().format('YYYY年MM月DD日 dddd'); 
+        }, 1000);
     </script>
 </head>
 <body class="flex flex-col h-screen">
@@ -381,7 +465,7 @@
             <h1 class="text-xl font-bold text-slate-800 mb-4">行政人員入口</h1>
             <input type="text" id="login-code" class="w-full p-3 border rounded-lg mb-3" placeholder="員工編號">
             <input type="password" id="login-password" class="w-full p-3 border rounded-lg mb-3" placeholder="密碼">
-            <label class="flex items-center gap-2 mb-6 cursor-pointer justify-center"><input type="checkbox" id="remember-me" class="w-4 h-4"><span class="text-sm text-slate-600">保持登入</span></label>
+            <label class="flex items-center gap-2 mb-6 cursor-pointer justify-center"><input type="checkbox" id="remember-me" class="w-4 h-4" checked disabled><span class="text-sm text-slate-600">保持登入 (預設開啟)</span></label>
             <button onclick="loginAs()" class="w-full bg-blue-600 text-white py-3 rounded-lg font-bold shadow-lg">登入</button>
         </div>
     </div>

@@ -3,29 +3,21 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>特休與補休管理系統 (資料顯示修復版)</title>
-    <script>
-        (function() {
-            const userSession = sessionStorage.getItem('kuangyou_user');
-            if (!userSession) {
-                alert("⛔ 非法存取！\n\n請由「管理後台」登入後操作。");
-                window.location.href = 'index.html'; 
-                return;
-            }
-        })();
-    </script>
+    <title>特休管理系統 (勞基法回溯修正版)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap" rel="stylesheet">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/dayjs/1.11.10/dayjs.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dayjs/1.11.10/plugin/isBetween.min.js"></script>
+    <script>dayjs.extend(window.dayjs_plugin_isBetween);</script>
     <style> 
-        body { font-family: 'Noto Sans TC', sans-serif; background-color: #f1f5f9; } 
+        body { font-family: 'Noto Sans TC', sans-serif; background-color: #f1f5f9; display: none; } 
         .tab-active { background-color: #2563eb; color: white; }
-        .tab-admin-active { background-color: #7c3aed; color: white; }
     </style>
 
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
-        import { getFirestore, collection, addDoc, updateDoc, deleteDoc, doc, onSnapshot, query, orderBy, where, getDocs, writeBatch } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+        import { getFirestore, collection, addDoc, updateDoc, deleteDoc, doc, onSnapshot, query, orderBy, where, getDocs, writeBatch, getDoc } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+        import { getAuth, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js";
 
         const firebaseConfig = {
             apiKey: "AIzaSyDkC6kfqpmEeMKIvWIqftounTSH_NPp25M",
@@ -39,6 +31,7 @@
 
         const app = initializeApp(firebaseConfig);
         const db = getFirestore(app);
+        const auth = getAuth(app);
 
         let allEmployees = [];
         let currentRole = 'caregiver'; 
@@ -46,17 +39,14 @@
         let currentEmpId = null;
         let currentEmpData = null;
         let ledgerData = []; 
-        let monthlyRecords = []; 
-        
         let unsubscribeLedger = null;
         let unsubscribeUsage = null;
         let currentGrantType = ""; 
 
-        // 綁定全域
         window.switchRole = switchRole;
         window.filterStatus = filterStatus;
         window.selectEmployee = selectEmployee;
-        window.runAutoGrant = runAutoGrant;
+        window.runAutoGrant = runAutoGrant; // ★ 核心修正
         window.openGrantModal = openGrantModal; 
         window.closeManualModal = closeManualModal;
         window.submitManualGrant = submitManualGrant;
@@ -66,88 +56,79 @@
         window.addUsageRecord = addUsageRecord;
         window.deleteUsageRecord = deleteUsageRecord;
         window.deleteLedgerItem = deleteLedgerItem;
+        window.logout = logout;
 
-        // 1. 初始化
-        const qEmp = query(collection(db, "employees"), orderBy("code"));
-        onSnapshot(qEmp, (snapshot) => {
-            allEmployees = [];
-            snapshot.forEach(doc => allEmployees.push({ id: doc.id, ...doc.data() }));
-            renderEmployeeList();
+        onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                try {
+                    const userDoc = await getDoc(doc(db, "employees", user.uid));
+                    if (userDoc.exists() && (userDoc.data().role === 'admin' || userDoc.data().role === 'super_admin')) {
+                        document.body.style.display = 'flex';
+                        initSystem();
+                    } else {
+                        alert("⛔ 權限不足"); await signOut(auth); window.location.href = 'index.html';
+                    }
+                } catch (e) { alert("驗證錯誤"); window.location.href = 'index.html'; }
+            } else { window.location.href = 'index.html'; }
         });
 
-        // 2. 切換職務
+        async function logout() { if(confirm("登出？")) { await signOut(auth); window.location.href = 'index.html'; } }
+
+        function initSystem() {
+            onSnapshot(query(collection(db, "employees"), orderBy("code")), (snapshot) => {
+                allEmployees = [];
+                snapshot.forEach(doc => allEmployees.push({ id: doc.id, ...doc.data() }));
+                renderEmployeeList();
+            });
+        }
+
         function switchRole(role) {
             currentRole = role;
-            const btnCare = document.getElementById('btn-caregiver');
-            const btnAdmin = document.getElementById('btn-admin');
-            
-            if (role === 'caregiver') {
-                btnCare.className = "flex-1 py-2 text-center font-bold rounded-l-lg border transition bg-blue-600 text-white tab-active";
-                btnAdmin.className = "flex-1 py-2 text-center font-bold rounded-r-lg border transition bg-white text-slate-600 hover:bg-slate-50";
-            } else {
-                btnCare.className = "flex-1 py-2 text-center font-bold rounded-l-lg border transition bg-white text-slate-600 hover:bg-slate-50";
-                btnAdmin.className = "flex-1 py-2 text-center font-bold rounded-r-lg border transition bg-purple-600 text-white tab-admin-active";
-            }
+            document.getElementById('btn-caregiver').className = role === 'caregiver' ? "w-32 py-2 font-bold rounded-l-lg bg-blue-600 text-white transition" : "w-32 py-2 font-bold rounded-l-lg bg-white text-slate-600 transition hover:bg-slate-50";
+            document.getElementById('btn-admin').className = role === 'admin' ? "w-32 py-2 font-bold rounded-r-lg bg-purple-600 text-white transition" : "w-32 py-2 font-bold rounded-r-lg bg-white text-slate-600 transition hover:bg-slate-50";
             currentEmpId = null;
             document.getElementById('right-panel').classList.add('hidden');
             document.getElementById('empty-panel').classList.remove('hidden');
             renderEmployeeList();
         }
 
-        // 3. 篩選
-        function filterStatus(status) {
-            currentStatusFilter = status;
-            renderEmployeeList();
-        }
+        function filterStatus(status) { currentStatusFilter = status; renderEmployeeList(); }
 
         function renderEmployeeList() {
-            const list = document.getElementById('emp-list');
-            list.innerHTML = "";
+            const list = document.getElementById('emp-list'); list.innerHTML = "";
             const filtered = allEmployees.filter(e => {
-                if (e.role !== currentRole) return false;
+                if (currentRole === 'admin') {
+                    if (e.role !== 'admin' && e.role !== 'super_admin') return false;
+                } else {
+                    if (e.role !== currentRole) return false;
+                }
                 if (currentStatusFilter === 'active') return !e.resignDate;
                 if (currentStatusFilter === 'resigned') return !!e.resignDate;
                 return true;
             });
 
             if(filtered.length === 0) { list.innerHTML = `<div class="p-8 text-center text-slate-400 text-sm">無符合資料</div>`; return; }
-
+            
             filtered.forEach(e => {
                 const isResigned = !!e.resignDate;
                 const statusBadge = isResigned ? '<span class="text-[10px] bg-red-100 text-red-600 px-1.5 py-0.5 rounded font-bold ml-2">離職</span>' : '';
-                const isActive = e.id === currentEmpId;
-                let activeClass = "bg-slate-100";
-                if(isActive) activeClass = currentRole === 'caregiver' ? 'bg-blue-50 border-l-4 border-blue-600' : 'bg-purple-50 border-l-4 border-purple-600';
-                else activeClass = 'hover:bg-slate-50 border-l-4 border-transparent';
-                
-                list.innerHTML += `
-                    <div onclick="selectEmployee('${e.id}')" class="p-3 cursor-pointer border-b transition ${activeClass}">
-                        <div class="flex justify-between items-center">
-                            <div class="font-bold text-slate-700 text-sm">${e.name} ${statusBadge}</div>
-                            <div class="text-xs text-slate-400 font-mono">${e.code}</div>
-                        </div>
-                        <div class="text-xs text-slate-400 mt-1">到職: ${e.joinDate}</div>
-                    </div>`;
+                const activeClass = e.id === currentEmpId ? (currentRole === 'caregiver' ? 'bg-blue-50 border-l-4 border-blue-600' : 'bg-purple-50 border-l-4 border-purple-600') : 'hover:bg-slate-50 border-l-4 border-transparent';
+                list.innerHTML += `<div onclick="selectEmployee('${e.id}')" class="p-3 cursor-pointer border-b transition ${activeClass}"><div class="flex justify-between items-center"><div class="font-bold text-slate-700 text-sm">${e.name} ${statusBadge}</div><div class="text-xs text-slate-400 font-mono">${e.code}</div></div><div class="text-xs text-slate-400 mt-1">到職: ${e.joinDate}</div></div>`;
             });
         }
 
-        // 4. 選擇員工 (核心)
-        async function selectEmployee(id) {
+        function selectEmployee(id) {
             if (unsubscribeLedger) unsubscribeLedger();
             if (unsubscribeUsage) unsubscribeUsage();
-
             currentEmpId = id;
             currentEmpData = allEmployees.find(e => e.id === id);
             renderEmployeeList();
 
             document.getElementById('right-panel').classList.remove('hidden');
             document.getElementById('empty-panel').classList.add('hidden');
-            
             document.getElementById('header-name').innerText = currentEmpData.name;
             document.getElementById('header-join').innerText = currentEmpData.joinDate;
-            const seniority = calculateSeniority(currentEmpData.joinDate);
-            document.getElementById('header-seniority').innerText = seniority.text;
-
+            document.getElementById('header-seniority').innerText = calculateSeniority(currentEmpData.joinDate).text;
             if (currentEmpData.resignDate) {
                 document.getElementById('resign-alert').classList.remove('hidden');
                 document.getElementById('resign-date').innerText = currentEmpData.resignDate;
@@ -155,18 +136,15 @@
                 document.getElementById('resign-alert').classList.add('hidden');
             }
 
-            // 監聽存摺
-            const qLedger = query(collection(db, "leave_ledger"), where("empId", "==", id));
-            unsubscribeLedger = onSnapshot(qLedger, (snap) => {
+            unsubscribeLedger = onSnapshot(query(collection(db, "leave_ledger"), where("empId", "==", id)), (snap) => {
                 ledgerData = [];
                 snap.forEach(doc => ledgerData.push({ id: doc.id, ...doc.data() }));
-                ledgerData.sort((a, b) => dayjs(b.validFrom).unix() - dayjs(a.validFrom).unix());
+                // 排序：讓最晚過期的在上面
+                ledgerData.sort((a, b) => dayjs(b.expiryDate).unix() - dayjs(a.expiryDate).unix());
                 renderLedger();
             });
 
-            // 監聽使用紀錄 (包含喪假、特休扣除等)
-            const qRecord = query(collection(db, "leave_records"), where("empId", "==", id));
-            unsubscribeUsage = onSnapshot(qRecord, (snap) => {
+            unsubscribeUsage = onSnapshot(query(collection(db, "leave_records"), where("empId", "==", id)), (snap) => {
                 let records = [];
                 snap.forEach(doc => records.push({id: doc.id, ...doc.data()}));
                 records.sort((a, b) => dayjs(b.date).unix() - dayjs(a.date).unix());
@@ -174,97 +152,224 @@
             });
         }
 
-        // 5. 渲染存摺
-        function renderLedger() {
-            const container = document.getElementById('ledger-container');
-            container.innerHTML = "";
-            let totalRemaining = 0;
-            let totalExpired = 0;
-            const today = dayjs();
+        // ============================================================
+        // ★★★ 核心功能：全自動回溯試算 (Ver 3.0 正確邏輯版) ★★★
+        // ============================================================
+        async function runAutoGrant() {
+            if (!currentEmpId || !currentEmpData) return alert("請先選擇員工");
+            
+            const joinDate = dayjs(currentEmpData.joinDate);
+            const now = dayjs();
+            const totalYears = now.diff(joinDate, 'year', true);
 
-            if (ledgerData.length === 0) container.innerHTML = `<div class="p-4 text-center text-slate-400 text-sm">尚無存摺資料 (請補入或自動試算)</div>`;
+            // 1. 預先撈取居服員月報 (如果是居服員)
+            let caregiverRecords = [];
+            if (currentRole === 'caregiver') {
+                const q = query(collection(db, "monthly_records"), where("empId", "==", currentEmpId));
+                const snap = await getDocs(q);
+                snap.forEach(d => caregiverRecords.push(d.data()));
+            }
+
+            // 2. 定義所有可能的里程碑 (從到職日開始推算，直到今天)
+            // 邏輯：0.5, 1.0, 2.0, 3.0 ... N.0
+            let milestones = [];
+            
+            // 檢查 0.5 年
+            if (totalYears >= 0.5) milestones.push(0.5);
+            
+            // 檢查 1.0, 2.0 ... N.0 年
+            for (let y = 1; y <= Math.floor(totalYears); y++) {
+                milestones.push(y);
+            }
+
+            let pendingGrants = [];
+
+            // 3. 迴圈檢查每個里程碑是否已領過
+            for (let marker of milestones) {
+                // 3.1 產生該里程碑的「理論資訊」(名稱、區間、天數)
+                const info = getMilestoneInfo(marker, joinDate);
+                
+                // 3.2 防呆檢查：資料庫是否已存在此里程碑？
+                // 檢查邏輯：sourceType 是否包含該名稱 (例如 "滿 1 年特休")
+                // 且 validFrom 是否一致 (避免同名但不同年度的誤判，雖然這裡是用年資算應該不會)
+                const isDuplicate = ledgerData.some(l => 
+                    l.sourceType.includes(info.title) && 
+                    l.validFrom === info.validFrom // 雙重確認生效日
+                );
+
+                if (!isDuplicate) {
+                    // 3.3 沒領過 -> 進行計算
+                    let grantHours = 0;
+                    if (currentRole === 'admin') {
+                        grantHours = info.statutoryDays * 8; // 行政固定
+                    } else {
+                        // 居服員 Pro-rata 計算
+                        grantHours = calculateCaregiverHours(caregiverRecords, info.calcStart, info.calcEnd, info.benchmark, info.statutoryDays);
+                    }
+
+                    if (grantHours > 0) {
+                        pendingGrants.push({ ...info, hours: grantHours });
+                    }
+                }
+            }
+
+            if (pendingGrants.length === 0) {
+                return alert("✅ 目前沒有需要補發的特休。\n(皆已發放或年資未滿)");
+            }
+
+            // 4. 產生總表讓管理員確認
+            let msg = `🧙‍♂️ 自動回溯試算報告\n員工：${currentEmpData.name}\n目前年資：${totalYears.toFixed(2)} 年\n\n發現以下漏發 (或需補發) 的特休：\n--------------------------------\n`;
+            
+            pendingGrants.forEach(g => {
+                msg += `📌 [${g.title}]\n`;
+                msg += `   計算區間：${g.calcStart.format('YYYY-MM')} ~ ${g.calcEnd.format('YYYY-MM')}\n`;
+                msg += `   生效日期：${g.validFrom} (歷史日期)\n`;
+                msg += `   使用期限：${g.expiryDate} (生效日+2年)\n`;
+                msg += `   核給時數：${g.hours} H\n\n`;
+            });
+            msg += `--------------------------------\n確定要一次匯入這 ${pendingGrants.length} 筆資料嗎？`;
+
+            if (confirm(msg)) {
+                const batch = writeBatch(db);
+                pendingGrants.forEach(g => {
+                    const ref = doc(collection(db, "leave_ledger"));
+                    batch.set(ref, {
+                        empId: currentEmpId,
+                        sourceType: `${g.title} (自動試算)`,
+                        originalHours: g.hours,
+                        remaining: g.hours,
+                        validFrom: g.validFrom,
+                        expiryDate: g.expiryDate,
+                        createdAt: new Date().toISOString()
+                    });
+                });
+                try {
+                    await batch.commit();
+                    alert("✅ 匯入成功！");
+                } catch(e) {
+                    console.error(e);
+                    alert("匯入失敗");
+                }
+            }
+        }
+
+        // 輔助：取得里程碑的標準資訊 (不含時數計算)
+        function getMilestoneInfo(yearMarker, joinDate) {
+            let title, calcStart, calcEnd, validFrom, expiryDate, benchmark;
+            const statutoryDays = getStatutoryDays(yearMarker);
+
+            if (yearMarker === 0.5) {
+                title = "滿半年特休";
+                benchmark = 1044;
+                // 計算區間：到職日 ~ +6個月
+                calcStart = joinDate.startOf('month');
+                calcEnd = joinDate.add(6, 'month').endOf('month');
+                // 生效日：到職滿6個月那天
+                validFrom = joinDate.add(6, 'month').format('YYYY-MM-DD');
+                // 到期日：生效日 + 2年 (勞基法遞延概念)
+                expiryDate = joinDate.add(6, 'month').add(2, 'year').format('YYYY-MM-DD');
+
+            } else if (yearMarker === 1.0) {
+                title = "滿 1 年特休";
+                benchmark = 2088;
+                // 計算區間：到職日 ~ +12個月
+                calcStart = joinDate.startOf('month');
+                calcEnd = joinDate.add(12, 'month').endOf('month');
+                // 生效日：到職滿1年那天
+                validFrom = joinDate.add(1, 'year').format('YYYY-MM-DD');
+                // 到期日：生效日 + 2年
+                expiryDate = joinDate.add(1, 'year').add(2, 'year').format('YYYY-MM-DD');
+
+            } else {
+                title = `滿 ${yearMarker} 年特休`;
+                benchmark = 2088;
+                // 計算區間：上一個週年日 ~ 這個週年日前一個月 (標準12個月)
+                calcStart = joinDate.add(yearMarker - 1, 'year').startOf('month');
+                calcEnd = joinDate.add(yearMarker, 'year').subtract(1, 'month').endOf('month');
+                // 生效日：到職滿 N 年那天
+                validFrom = joinDate.add(yearMarker, 'year').format('YYYY-MM-DD');
+                // 到期日：生效日 + 2年
+                expiryDate = joinDate.add(yearMarker, 'year').add(2, 'year').format('YYYY-MM-DD');
+            }
+
+            return { title, statutoryDays, benchmark, calcStart, calcEnd, validFrom, expiryDate };
+        }
+
+        // 輔助：居服員時數計算
+        function calculateCaregiverHours(records, start, end, benchmark, days) {
+            let totalBase = 0;
+            records.forEach(r => {
+                if (r.yearMonth) {
+                    const rDate = dayjs(r.yearMonth + "-01");
+                    // 包含頭尾月份
+                    if (rDate.isBetween(start, end, 'month', '[]')) {
+                        totalBase += Number(r.totalBaseHours) || 0;
+                    }
+                }
+            });
+            // 公式：(累積 / 基準) * 天數 * 8
+            const result = (totalBase / benchmark) * days * 8;
+            return Math.round(result * 100) / 100;
+        }
+
+        function getStatutoryDays(years) {
+            if (years < 0.5) return 0;
+            if (years < 1) return 3;
+            if (years < 2) return 7;
+            if (years < 3) return 10;
+            if (years < 5) return 14;
+            if (years < 10) return 15;
+            return Math.min(30, 15 + Math.floor(years - 10));
+        }
+
+        function renderLedger() {
+            const container = document.getElementById('ledger-container'); container.innerHTML = "";
+            let totalRemaining = 0, totalExpired = 0;
+            const today = dayjs();
+            if (ledgerData.length === 0) container.innerHTML = `<div class="p-4 text-center text-slate-400 text-sm">尚無存摺資料</div>`;
 
             ledgerData.forEach(item => {
                 const expiry = dayjs(item.expiryDate);
+                // 寬限期判斷：如果過了 expiryDate 就算過期
                 const isExpired = expiry.isBefore(today);
                 const isExhausted = item.remaining <= 0;
                 
-                if (!isExhausted) {
-                    if (isExpired) totalExpired += item.remaining;
-                    else totalRemaining += item.remaining;
+                if (!isExhausted) { 
+                    if (isExpired) totalExpired += item.remaining; 
+                    else totalRemaining += item.remaining; 
                 }
 
                 let statusHtml = "", rowClass = "hover:bg-slate-50";
-                
                 if (isExhausted) { statusHtml = `<span class="bg-gray-100 text-gray-400 text-xs px-2 py-1 rounded">已用完</span>`; rowClass = "bg-gray-50 opacity-60"; }
                 else if (isExpired) { statusHtml = `<span class="bg-red-100 text-red-600 text-xs px-2 py-1 rounded">已過期</span>`; }
                 else { statusHtml = `<span class="bg-green-100 text-green-700 text-xs px-2 py-1 rounded">使用中</span>`; }
+                
+                let sourceBadge = item.sourceType.includes("補休") ? '⚡ ' : (item.sourceType.includes("特休") ? '🎁 ' : '📥 ');
 
-                let sourceBadge = item.sourceType.includes("補休") ? '⚡ ' : (item.sourceType.includes("餘額") ? '📥 ' : '📅 ');
-
-                container.innerHTML += `
-                    <div class="grid grid-cols-12 gap-2 p-3 text-sm border-b items-center ${rowClass} group">
-                        <div class="col-span-3">
-                            <div class="font-bold text-slate-700 truncate" title="${item.sourceType}">${sourceBadge}${item.sourceType}</div>
-                            <div class="text-[10px] text-slate-400">${item.validFrom} 生效</div>
-                        </div>
-                        <div class="col-span-3 text-xs text-slate-500 flex flex-col justify-center">
-                            <span>效期至</span><span class="font-mono text-slate-700 font-bold ${item.sourceType.includes('補休') ? 'text-orange-600' : ''}">${item.expiryDate}</span>
-                        </div>
-                        <div class="col-span-2 text-right text-slate-400 font-mono">${item.originalHours.toFixed(3)}</div>
-                        <div class="col-span-2 text-right font-bold text-blue-600 font-mono text-lg">${item.remaining.toFixed(3)}</div>
-                        <div class="col-span-2 text-right flex flex-col items-end gap-1">
-                            ${statusHtml}
-                            <button onclick="deleteLedgerItem('${item.id}')" class="text-[10px] text-red-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition">刪除</button>
-                        </div>
-                    </div>`;
+                container.innerHTML += `<div class="grid grid-cols-12 gap-2 p-3 text-sm border-b items-center ${rowClass} group"><div class="col-span-3"><div class="font-bold text-slate-700 truncate" title="${item.sourceType}">${sourceBadge}${item.sourceType}</div><div class="text-[10px] text-slate-400">${item.validFrom} 生效</div></div><div class="col-span-3 text-xs text-slate-500 flex flex-col justify-center"><span>效期至</span><span class="font-mono text-slate-700 font-bold ${item.sourceType.includes('補休')?'text-orange-600':''}">${item.expiryDate}</span></div><div class="col-span-2 text-right text-slate-400 font-mono">${item.originalHours.toFixed(2)}</div><div class="col-span-2 text-right font-bold text-blue-600 font-mono text-lg">${item.remaining.toFixed(2)}</div><div class="col-span-2 text-right flex flex-col items-end gap-1">${statusHtml}<button onclick="deleteLedgerItem('${item.id}')" class="text-[10px] text-red-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition">刪除</button></div></div>`;
             });
-
-            document.getElementById('big-balance').innerText = totalRemaining.toFixed(3);
-            const expiredBox = document.getElementById('expired-section');
-            if (totalExpired > 0) { expiredBox.classList.remove('hidden'); document.getElementById('expired-balance').innerText = totalExpired.toFixed(3); } 
-            else { expiredBox.classList.add('hidden'); }
+            document.getElementById('big-balance').innerText = totalRemaining.toFixed(2);
+            document.getElementById('expired-section').classList.toggle('hidden', totalExpired <= 0);
+            document.getElementById('expired-balance').innerText = totalExpired.toFixed(2);
         }
 
-        // 6. 渲染使用紀錄 (★ 修復重點)
         function renderUsageHistory(records) {
-            const tbody = document.getElementById('history-list');
-            tbody.innerHTML = "";
+            const tbody = document.getElementById('history-list'); tbody.innerHTML = "";
             if(records.length === 0) { tbody.innerHTML = `<tr><td colspan="5" class="p-8 text-center text-slate-400 text-sm">尚無請假紀錄</td></tr>`; return; }
-
             records.forEach(r => {
                 const logStr = r.deductionLog ? JSON.stringify(r.deductionLog) : "";
                 let typeClass = "bg-gray-100 text-gray-600";
-                
-                // 視覺分類
-                if(r.type.includes('特休') || r.type.includes('補休') || r.type.includes('有薪')) typeClass = "bg-green-100 text-green-700";
+                if(r.type.includes('特休')||r.type.includes('補休')||r.type.includes('有薪')) typeClass = "bg-green-100 text-green-700";
                 else if(r.type === 'cash_out') typeClass = "bg-yellow-100 text-yellow-800 border border-yellow-300"; 
-                else if(r.type.includes('病') || r.type.includes('傷') || r.type.includes('喪')) typeClass = "bg-purple-100 text-purple-700";
-
-                const typeLabel = r.type === 'cash_out' ? '💰 折現' : r.type;
+                else if(r.type.includes('病')||r.type.includes('喪')) typeClass = "bg-purple-100 text-purple-700";
                 
-                // ★ 產生扣款詳情 (Tooltip)
                 let detailHint = "";
-                if(r.deductionLog && r.deductionLog.length > 0) {
-                    const details = r.deductionLog.map(l => `${l.source}: -${l.amount}`).join('\n');
-                    detailHint = `<div class="text-[10px] text-slate-400 mt-1" title="${details}">└ 扣除: ${r.deductionLog[0].source}...</div>`;
-                }
+                if(r.deductionLog && r.deductionLog.length > 0) detailHint = `<div class="text-[10px] text-slate-400 mt-1">└ 扣: ${r.deductionLog[0].source}</div>`;
 
-                tbody.innerHTML += `
-                    <tr class="border-b hover:bg-slate-50 text-sm">
-                        <td class="p-3 font-mono">${r.date}</td>
-                        <td class="p-3">
-                            <span class="px-2 py-1 rounded text-xs font-bold ${typeClass}">${typeLabel}</span>
-                            ${detailHint}
-                        </td>
-                        <td class="p-3 font-bold text-center">${r.hours}</td>
-                        <td class="p-3 text-slate-500 text-xs">${r.note||''}</td>
-                        <td class="p-3 text-center"><button onclick="deleteUsageRecord('${r.id}', '${r.type}', '${logStr.replace(/"/g, '&quot;')}')" class="text-red-400 hover:text-red-600 font-bold">×</button></td>
-                    </tr>`;
+                tbody.innerHTML += `<tr class="border-b hover:bg-slate-50 text-sm"><td class="p-3 font-mono">${r.date}</td><td class="p-3"><span class="px-2 py-1 rounded text-xs font-bold ${typeClass}">${r.type==='cash_out'?'💰 折現':r.type}</span>${detailHint}</td><td class="p-3 font-bold text-center">${r.hours}</td><td class="p-3 text-slate-500 text-xs">${r.note||''}</td><td class="p-3 text-center"><button onclick="deleteUsageRecord('${r.id}', '${r.type}', '${logStr.replace(/"/g, '&quot;')}')" class="text-red-400 hover:text-red-600 font-bold">×</button></td></tr>`;
             });
         }
 
-        // 彈窗與業務邏輯 (維持原樣)
         function openGrantModal(type) {
             if (!currentEmpId) return;
             currentGrantType = type;
@@ -274,7 +379,6 @@
             const expiryInput = document.getElementById('mg-expiry'); 
             document.getElementById('mg-hours').value = '';
             dateInput.value = dayjs().format('YYYY-MM-DD');
-
             if (type === 'old_balance') { title.innerHTML = '<span class="text-2xl">📥</span> 補入期初/舊制餘額'; expiryInput.value = dayjs().add(1, 'year').format('YYYY-MM-DD'); } 
             else if (type === 'comp_time') { title.innerHTML = '<span class="text-2xl">⚡</span> 新增加班補休'; expiryInput.value = dayjs().add(1, 'year').format('YYYY-MM-DD'); }
         }
@@ -286,8 +390,7 @@
             const expiryStr = document.getElementById('mg-expiry').value;
             if (isNaN(hours) || hours <= 0 || !dateStr || !expiryStr) return alert("請填寫正確");
             let sourceType = currentGrantType === 'old_balance' ? "期初移轉餘額" : `加班補休 (${dateStr})`;
-            try { await addDoc(collection(db, "leave_ledger"), { empId: currentEmpId, sourceType, originalHours: hours, remaining: hours, validFrom: dateStr, expiryDate: expiryStr, createdAt: new Date().toISOString() }); closeManualModal(); } 
-            catch(e) { alert("失敗"); }
+            try { await addDoc(collection(db, "leave_ledger"), { empId: currentEmpId, sourceType, originalHours: hours, remaining: hours, validFrom: dateStr, expiryDate: expiryStr, createdAt: new Date().toISOString() }); closeManualModal(); } catch(e) { alert("失敗"); }
         }
 
         function openCashOutModal() {
@@ -304,8 +407,6 @@
             const date = document.getElementById('co-date').value;
             const hours = parseFloat(document.getElementById('co-hours').value);
             if (!date || isNaN(hours) || hours <= 0) return alert("錯誤");
-            // ... (折現邏輯與之前相同，略以節省篇幅，請保留原邏輯) ...
-            // 為確保完整性，建議直接複製上一版的 submitCashOut 邏輯
             const activeLedgers = ledgerData.filter(l => l.remaining > 0).sort((a,b)=>dayjs(a.expiryDate).unix()-dayjs(b.expiryDate).unix());
             if(activeLedgers.reduce((s,l)=>s+l.remaining,0) < hours) return alert("餘額不足");
             const batch = writeBatch(db);
@@ -328,14 +429,11 @@
             const hours = parseFloat(document.getElementById('rec-hours').value);
             const note = document.getElementById('rec-note').value;
             if (!date || !hours || hours <= 0) return alert("請填寫正確");
-
-            // 手動請假 (不扣存摺)
             if (type !== 'paid_leave') {
                 const typeMap = { 'sick': '病假', 'personal': '事假', 'funeral': '喪假', 'marriage': '婚假', 'official': '公假' };
                 await addDoc(collection(db, "leave_records"), { empId: currentEmpId, date, type: typeMap[type]||type, hours, note, deductionLog: [], createdAt: new Date().toISOString() });
                 document.getElementById('rec-hours').value = ""; return;
             }
-            // 扣存摺
             const active = ledgerData.filter(l=>l.remaining>0 && dayjs(l.expiryDate).isAfter(dayjs())).sort((a,b)=>dayjs(a.expiryDate).unix()-dayjs(b.expiryDate).unix());
             if(active.reduce((s,l)=>s+l.remaining,0) < hours) return alert("餘額不足");
             const batch = writeBatch(db);
@@ -355,12 +453,9 @@
         async function deleteUsageRecord(id, type, deductionLogJson) {
             if (!confirm("刪除此紀錄？\n(若為特休，將自動退還額度)")) return;
             const batch = writeBatch(db);
-            // 退還額度邏輯
             if ((type.includes('特休') || type.includes('有薪') || type==='cash_out') && deductionLogJson) {
                 const logs = JSON.parse(deductionLogJson);
                 for(let log of logs) {
-                    // 必須去資料庫撈最新的 ledger 狀態，不能只依賴前端 cache
-                    // 但這裡為了簡便，假設 ledgerData 是最新的 (onSnapshot 會更新)
                     const currentLedger = ledgerData.find(l => l.id === log.ledgerId);
                     if(currentLedger) batch.update(doc(db, "leave_ledger", log.ledgerId), { remaining: currentLedger.remaining + log.amount });
                 }
@@ -374,17 +469,17 @@
             const diff = dayjs().diff(dayjs(joinDateStr), 'year', true);
             return { text: `${Math.floor(diff)}年 ${Math.floor((diff%1)*365)}天`, years: diff };
         }
-        // 自動試算 (保留原邏輯，略)
-        async function runAutoGrant() { alert("請參考上一版代碼，此處邏輯不變"); }
     </script>
 </head>
 <body class="h-screen flex flex-col p-6 overflow-hidden">
-
     <div class="flex justify-between items-center mb-6 shrink-0">
         <div><h1 class="text-2xl font-bold text-slate-800 flex items-center gap-2">📅 特休與補休管理系統</h1></div>
-        <div class="bg-white border rounded-lg flex shadow-sm">
-            <button id="btn-caregiver" onclick="switchRole('caregiver')" class="w-32 py-2 font-bold rounded-l-lg bg-blue-600 text-white transition">🏠 居服員</button>
-            <button id="btn-admin" onclick="switchRole('admin')" class="w-32 py-2 font-bold rounded-r-lg bg-white text-slate-600 transition hover:bg-slate-50">💼 行政</button>
+        <div class="flex gap-3">
+             <div class="bg-white border rounded-lg flex shadow-sm">
+                <button id="btn-caregiver" onclick="switchRole('caregiver')" class="w-32 py-2 font-bold rounded-l-lg bg-blue-600 text-white transition">🏠 居服員</button>
+                <button id="btn-admin" onclick="switchRole('admin')" class="w-32 py-2 font-bold rounded-r-lg bg-white text-slate-600 transition hover:bg-slate-50">💼 行政</button>
+            </div>
+            <button onclick="logout()" class="bg-slate-200 text-slate-600 px-4 py-2 rounded-lg font-bold hover:bg-slate-300">登出</button>
         </div>
     </div>
 
@@ -392,9 +487,7 @@
         <div class="col-span-3 bg-white rounded-2xl shadow-lg border border-slate-200 flex flex-col overflow-hidden">
             <div class="p-3 bg-slate-50 border-b flex justify-between items-center">
                 <span class="font-bold text-slate-500 text-xs">員工列表</span>
-                <select onchange="filterStatus(this.value)" class="text-xs border rounded p-1 bg-white outline-none cursor-pointer hover:bg-slate-100">
-                    <option value="active">顯示在職</option><option value="resigned">顯示離職</option><option value="all">顯示全部</option>
-                </select>
+                <select onchange="filterStatus(this.value)" class="text-xs border rounded p-1 bg-white outline-none cursor-pointer hover:bg-slate-100"><option value="active">顯示在職</option><option value="resigned">顯示離職</option><option value="all">顯示全部</option></select>
             </div>
             <div id="emp-list" class="flex-1 overflow-y-auto"></div>
         </div>
@@ -418,10 +511,10 @@
                     </div>
                     <div class="text-right">
                         <div class="text-xs font-bold text-slate-400 uppercase tracking-wider">Total Available</div>
-                        <div class="text-5xl font-black text-blue-600 tracking-tight" id="big-balance">0.000</div>
+                        <div class="text-5xl font-black text-blue-600 tracking-tight" id="big-balance">0.00</div>
                         <div class="text-xs text-slate-400 font-bold mt-1">可用總時數 (含遞延)</div>
                         <div id="expired-section" class="mt-3 pt-2 border-t border-slate-100 hidden">
-                            <div class="text-2xl font-bold text-red-500" id="expired-balance">0.000</div>
+                            <div class="text-2xl font-bold text-red-500" id="expired-balance">0.00</div>
                             <div class="text-xs text-red-400 font-bold">待結算時數 (已過期)</div>
                         </div>
                     </div>
@@ -432,9 +525,10 @@
                         <div class="p-3 bg-slate-50 border-b flex justify-between items-center">
                             <h3 class="font-bold text-slate-700 flex items-center gap-2">📚 特休/補休存摺 (FIFO)</h3>
                             <div class="flex gap-1">
-                                <button onclick="openCashOutModal()" class="bg-yellow-100 hover:bg-yellow-200 text-yellow-800 border border-yellow-300 px-2 py-1 rounded text-xs font-bold shadow-sm transition">💰 提早折現</button>
-                                <button onclick="openGrantModal('comp_time')" class="bg-orange-50 border border-orange-200 hover:bg-orange-100 text-orange-700 px-2 py-1 rounded text-xs font-bold shadow-sm transition">+ 新增加班補休</button>
-                                <button onclick="openGrantModal('old_balance')" class="bg-white border border-slate-300 hover:bg-slate-50 text-slate-600 px-2 py-1 rounded text-xs font-bold shadow-sm transition">+ 補入舊餘額</button>
+                                <button onclick="runAutoGrant()" class="bg-purple-100 hover:bg-purple-200 text-purple-800 border border-purple-300 px-2 py-1 rounded text-xs font-bold shadow-sm transition">🧙‍♂️ 自動試算</button>
+                                <button onclick="openCashOutModal()" class="bg-yellow-100 hover:bg-yellow-200 text-yellow-800 border border-yellow-300 px-2 py-1 rounded text-xs font-bold shadow-sm transition">💰 折現</button>
+                                <button onclick="openGrantModal('comp_time')" class="bg-orange-50 border border-orange-200 hover:bg-orange-100 text-orange-700 px-2 py-1 rounded text-xs font-bold shadow-sm transition">+ 補休</button>
+                                <button onclick="openGrantModal('old_balance')" class="bg-white border border-slate-300 hover:bg-slate-50 text-slate-600 px-2 py-1 rounded text-xs font-bold shadow-sm transition">+ 舊餘額</button>
                             </div>
                         </div>
                         <div class="grid grid-cols-12 gap-2 p-2 bg-slate-100 text-xs text-slate-500 font-bold border-b">
@@ -447,11 +541,7 @@
                         <div class="p-4 bg-slate-50 border-b" id="usage-form">
                             <div class="flex gap-2 mb-2">
                                 <div class="flex-1"><label class="text-[10px] font-bold text-slate-400 block mb-1">日期</label><input type="date" id="rec-date" class="w-full border rounded px-2 py-1 text-sm font-bold text-slate-700"></div>
-                                <div class="w-32"><label class="text-[10px] font-bold text-slate-400 block mb-1">假別</label>
-                                    <select id="rec-type" class="w-full border rounded px-1 py-1 text-sm bg-white font-bold text-slate-700">
-                                        <option value="paid_leave">有薪假 (特休/補休)</option><option value="sick">病假</option><option value="personal">事假</option><option value="funeral">喪假</option><option value="marriage">婚假</option><option value="official">公假</option>
-                                    </select>
-                                </div>
+                                <div class="w-32"><label class="text-[10px] font-bold text-slate-400 block mb-1">假別</label><select id="rec-type" class="w-full border rounded px-1 py-1 text-sm bg-white font-bold text-slate-700"><option value="paid_leave">有薪假 (特休/補休)</option><option value="sick">病假</option><option value="personal">事假</option><option value="funeral">喪假</option><option value="marriage">婚假</option><option value="official">公假</option></select></div>
                                 <div class="w-20"><label class="text-[10px] font-bold text-slate-400 block mb-1">時數</label><input type="number" id="rec-hours" class="w-full border rounded px-2 py-1 text-sm text-center font-bold" placeholder="4"></div>
                             </div>
                             <div class="flex gap-2">
@@ -459,23 +549,16 @@
                                 <button onclick="addUsageRecord()" class="bg-green-600 hover:bg-green-700 text-white px-4 rounded text-sm font-bold shadow">扣除</button>
                             </div>
                         </div>
-                        
                         <div class="flex-1 overflow-y-auto bg-white">
-                            <table class="w-full text-sm text-left">
-                                <thead class="bg-slate-100 text-xs text-slate-500 font-bold sticky top-0">
-                                    <tr><th class="p-3 w-28">日期</th><th class="p-3 w-28">假別</th><th class="p-3 w-16 text-center">時數</th><th class="p-3">備註</th><th class="p-3 w-10"></th></tr>
-                                </thead>
-                                <tbody id="history-list" class="divide-y divide-slate-100"></tbody>
-                            </table>
+                            <table class="w-full text-sm text-left"><thead class="bg-slate-100 text-xs text-slate-500 font-bold sticky top-0"><tr><th class="p-3 w-28">日期</th><th class="p-3 w-28">假別</th><th class="p-3 w-16 text-center">時數</th><th class="p-3">備註</th><th class="p-3 w-10"></th></tr></thead><tbody id="history-list" class="divide-y divide-slate-100"></tbody></table>
                         </div>
                     </div>
                 </div>
             </div>
         </div>
     </div>
-
+    
     <div id="manual-grant-modal" class="hidden fixed inset-0 bg-black/50 z-50 flex items-center justify-center backdrop-blur-sm"><div class="bg-white p-6 rounded-2xl w-96"><h3 id="modal-title" class="font-bold text-lg mb-4"></h3><input type="date" id="mg-date" class="w-full border rounded mb-2"><input type="number" id="mg-hours" class="w-full border rounded mb-2" placeholder="時數"><input type="date" id="mg-expiry" class="w-full border rounded mb-2"><div class="flex justify-end gap-2"><button onclick="closeManualModal()" class="px-3 py-1 border rounded">取消</button><button onclick="submitManualGrant()" class="px-3 py-1 bg-blue-600 text-white rounded">確認</button></div></div></div>
     <div id="cash-out-modal" class="hidden fixed inset-0 bg-black/50 z-50 flex items-center justify-center backdrop-blur-sm"><div class="bg-white p-6 rounded-2xl w-96"><h3 class="font-bold text-lg mb-4">💰 折現</h3><input type="date" id="co-date" class="w-full border rounded mb-2"><input type="number" id="co-hours" class="w-full border rounded mb-2" placeholder="時數"><div class="flex justify-end gap-2"><button onclick="closeCashOutModal()" class="px-3 py-1 border rounded">取消</button><button onclick="submitCashOut()" class="px-3 py-1 bg-yellow-500 text-white rounded">確認</button></div></div></div>
-
 </body>
 </html>

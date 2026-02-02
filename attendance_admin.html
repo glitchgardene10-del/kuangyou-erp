@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>考勤與審核管理後台 (ERP整合核心)</title>
+    <title>考勤與審核管理後台 (ERP核心-安全版)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&display=swap" rel="stylesheet">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/dayjs/1.11.10/dayjs.min.js"></script>
@@ -22,6 +22,7 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
         import { getFirestore, collection, getDocs, getDoc, doc, query, where, orderBy, updateDoc, addDoc, deleteDoc, writeBatch, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+        import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js";
 
         const firebaseConfig = {
             apiKey: "AIzaSyDkC6kfqpmEeMKIvWIqftounTSH_NPp25M",
@@ -35,6 +36,7 @@
 
         const app = initializeApp(firebaseConfig);
         const db = getFirestore(app);
+        const auth = getAuth(app); 
 
         // 綁定全域
         window.db = db; window.collection = collection; window.getDoc = getDoc; window.doc = doc; window.updateDoc = updateDoc; window.addDoc = addDoc; window.deleteDoc = deleteDoc; window.writeBatch = writeBatch; window.setDoc = setDoc;
@@ -65,28 +67,63 @@
         window.submitManualEntry = submitManualEntry;
         window.approveCorrection = approveCorrection;
 
-        // 自動登入
-        (function() {
-            const stored = sessionStorage.getItem('kuangyou_user');
-            if(stored) {
+        // ★ 核心修正：統一使用 UID 直讀模式
+        onAuthStateChanged(auth, async (user) => {
+            if (user) {
                 try {
-                    const user = JSON.parse(stored);
-                    currentUser = user;
-                    setTimeout(() => {
-                        document.getElementById('login-screen').classList.add('hidden');
-                        document.getElementById('main-screen').classList.remove('hidden');
-                        document.getElementById('current-user').innerText = user.name;
-                        loadEmployeeData().then(() => {
-                            renderSidebar();
-                            handleLoginRedirect(user);
-                        });
-                        startSettingsListener();
-                    }, 500);
-                } catch(e) { console.error("Auto Login Failed", e); }
+                    // 直接用 Auth UID 讀取 Firestore 資料，不再區分 admin 字串
+                    const userDocRef = doc(db, "employees", user.uid);
+                    const userSnap = await getDoc(userDocRef);
+
+                    if (userSnap.exists()) {
+                        const userData = userSnap.data();
+                        
+                        // 權限檢查：必須是 admin (包含一般行政與超級管理員)
+                        if (userData.role === 'admin' || userData.role === 'super_admin') {
+                            // 為了相容舊資料，若 role 是 admin 但 code 是 admin，視為超級管理員
+                            if (userData.code === 'admin') userData.role = 'super_admin'; 
+                            
+                            performLoginSuccess({ id: user.uid, ...userData });
+                        } else {
+                            alert("⛔ 權限不足：您不是管理員");
+                            await signOut(auth);
+                        }
+                    } else {
+                        // 有 Auth 但無資料庫紀錄
+                        alert("❌ 帳號資料異常 (No Profile)");
+                        await signOut(auth);
+                    }
+                } catch (error) {
+                    console.error("Login Error:", error);
+                    alert("登入過程發生錯誤");
+                    await signOut(auth);
+                }
+            } else {
+                // 未登入
+                document.getElementById('login-screen').classList.remove('hidden');
+                document.getElementById('main-screen').classList.add('hidden');
+                sessionStorage.removeItem('kuangyou_user');
             }
-        })();
+        });
+
+        // 登入成功後的處理
+        function performLoginSuccess(user) {
+            currentUser = user;
+            sessionStorage.setItem('kuangyou_user', JSON.stringify(user));
+            
+            document.getElementById('login-screen').classList.add('hidden');
+            document.getElementById('main-screen').classList.remove('hidden');
+            document.getElementById('current-user').innerText = user.name || user.code;
+            
+            startSettingsListener();
+            loadEmployeeData().then(() => {
+                renderSidebar();
+                handleLoginRedirect(user);
+            });
+        }
 
         function handleLoginRedirect(user) {
+            // 預設跳轉邏輯
             if (user.role === 'super_admin') { switchTab('dashboard'); } 
             else {
                 if (systemSettings.allowedProxies?.includes(user.id)) { switchTab('proxy'); } 
@@ -99,9 +136,9 @@
                 if (docSnap.exists()) {
                     systemSettings = { ...systemSettings, ...docSnap.data() };
                     if(document.getElementById('work-start')) {
-                        document.getElementById('work-start').value = systemSettings.workStartTime;
-                        document.getElementById('work-end').value = systemSettings.workEndTime;
-                        document.getElementById('clock-buffer').value = systemSettings.clockBuffer;
+                        document.getElementById('work-start').value = systemSettings.workStartTime || "08:30";
+                        document.getElementById('work-end').value = systemSettings.workEndTime || "17:30";
+                        document.getElementById('clock-buffer').value = systemSettings.clockBuffer || 5;
                     }
                     if(allAdmins.length > 0) renderPermissionTable();
                 }
@@ -116,7 +153,10 @@
                 snapshot.forEach(doc => {
                     const e = { id: doc.id, ...doc.data() };
                     if (!e.resignDate) {
-                        if (e.role === 'admin') { allAdmins.push(e); adminIds.add(e.id); } 
+                        // 統一管理員與超級管理員都視為 Admin 群組
+                        if (e.role === 'admin' || e.role === 'super_admin') { 
+                            allAdmins.push(e); adminIds.add(e.id); 
+                        } 
                         else if (e.role === 'caregiver') { allCaregivers.push(e); }
                     }
                 });
@@ -135,6 +175,7 @@
         function updateDashboardStats() {
             const totalEmployees = allAdmins.length + allCaregivers.length;
             document.getElementById('stat-employees').innerText = totalEmployees;
+            // 只有超級管理員可以看到待簽核提示 (或是有權限的人)
             if (currentUser && currentUser.role === 'super_admin') {
                 document.getElementById('card-pending').classList.remove('hidden');
             } else {
@@ -147,37 +188,37 @@
             const pwdInput = document.getElementById('login-password').value.trim();
             if(!codeInput || !pwdInput) return alert("請輸入員工編號與密碼");
 
-            if(codeInput === 'ai1928372002' && pwdInput === '159753') {
-                currentUser = { id: 'super', name: '總管理員', role: 'super_admin' };
-                doLogin(currentUser); return;
-            }
+            const email = `${codeInput}@kuangyou.internal`;
 
             try {
-                const q = query(collection(db, "employees"), where("code", "==", codeInput));
-                const snapshot = await getDocs(q);
-                if (snapshot.empty) return alert("❌ 找不到此員工編號");
-                const userDoc = snapshot.docs[0];
-                const userData = userDoc.data();
-                if (userData.role !== 'admin') return alert("⛔ 權限不足");
-                if (userData.resignDate) return alert("⛔ 此帳號已離職");
-                const correctPwd = userData.password || "0000";
-                if (String(pwdInput) === String(correctPwd)) {
-                    currentUser = { id: userDoc.id, name: userData.name, role: 'admin' };
-                    doLogin(currentUser);
-                } else { alert("❌ 密碼錯誤！(預設 0000)"); }
-            } catch (e) { console.error(e); alert("登入失敗"); }
+                const btn = document.querySelector('#login-screen button');
+                const oldText = btn.innerText;
+                btn.innerText = "驗證中...";
+                btn.disabled = true;
+
+                await signInWithEmailAndPassword(auth, email, pwdInput);
+                // 成功後交由 onAuthStateChanged 處理
+                
+            } catch (e) { 
+                console.error(e); 
+                if(e.code === 'auth/invalid-credential' || e.code === 'auth/user-not-found' || e.code === 'auth/wrong-password') {
+                    alert("❌ 帳號或密碼錯誤");
+                } else {
+                    alert("登入失敗：" + e.message);
+                }
+                const btn = document.querySelector('#login-screen button');
+                btn.innerText = "進入系統 ➔";
+                btn.disabled = false;
+            }
         }
 
-        function doLogin(user) {
-            sessionStorage.setItem('kuangyou_user', JSON.stringify(user));
-            document.getElementById('login-screen').classList.add('hidden');
-            document.getElementById('main-screen').classList.remove('hidden');
-            document.getElementById('current-user').innerText = user.name;
-            startSettingsListener();
-            loadEmployeeData().then(() => {
-                renderSidebar();
-                handleLoginRedirect(user);
-            });
+        function logout() {
+            if(confirm("確定要登出嗎？")) {
+                signOut(auth).then(() => {
+                    sessionStorage.removeItem('kuangyou_user');
+                    window.location.reload();
+                });
+            }
         }
 
         function toggleSidebar() { document.getElementById('sidebar').classList.toggle('-translate-x-full'); document.getElementById('sidebar').classList.toggle('w-0'); document.getElementById('sidebar').classList.toggle('w-64'); }
@@ -187,23 +228,35 @@
             nav.innerHTML = '';
             nav.innerHTML += `<div onclick="switchTab('dashboard')" id="nav-dashboard" class="nav-item"><span>🏠</span> 首頁儀表板</div>`;
             nav.innerHTML += `<div class="px-4 py-2 text-xs font-bold text-slate-400 uppercase tracking-wider mt-2">簽核與監控</div>`;
-            if (currentUser.role === 'super_admin') {
+            
+            // 權限判斷：超級管理員擁有所有權限
+            const isSuper = currentUser.role === 'super_admin';
+
+            if (isSuper) {
                 nav.innerHTML += `<div onclick="switchTab('approval')" id="nav-approval" class="nav-item"><span>✅</span> 待簽核清單 <span id="badge-count" class="bg-red-500 text-white text-[10px] px-2 rounded-full hidden">0</span></div>`;
                 nav.innerHTML += `<div onclick="switchTab('attendance')" id="nav-attendance" class="nav-item"><span>📊</span> 行政出勤監控</div>`;
             }
-            if (hasPermission('allowedProxies')) { nav.innerHTML += `<div onclick="switchTab('proxy')" id="nav-proxy" class="nav-item"><span>📝</span> 居服員代申請</div>`; }
+            if (isSuper || hasPermission('allowedProxies')) { nav.innerHTML += `<div onclick="switchTab('proxy')" id="nav-proxy" class="nav-item"><span>📝</span> 居服員代申請</div>`; }
+            
             nav.innerHTML += `<div class="px-4 py-2 text-xs font-bold text-slate-400 uppercase tracking-wider mt-4">ERP 核心系統</div>`;
-            if (hasPermission('allowedEmployee')) { nav.innerHTML += `<div id="nav-emp" onclick="openExternalSystem('employee.html', this)" class="nav-item"><span>👥</span> 員工資料庫</div>`; }
-            if (hasPermission('allowedLeave')) { nav.innerHTML += `<div onclick="openExternalSystem('leave.html', this)" class="nav-item"><span>📚</span> 特休存摺管理</div>`; }
-            if (hasPermission('allowedSalary')) {
+            
+            if (isSuper || hasPermission('allowedEmployee')) { nav.innerHTML += `<div id="nav-emp" onclick="openExternalSystem('employee.html', this)" class="nav-item"><span>👥</span> 員工資料庫</div>`; }
+            if (isSuper || hasPermission('allowedLeave')) { nav.innerHTML += `<div onclick="openExternalSystem('leave.html', this)" class="nav-item"><span>📚</span> 特休存摺管理</div>`; }
+            if (isSuper || hasPermission('allowedSalary')) {
                 nav.innerHTML += `<div onclick="openExternalSystem('salary.html', this)" class="nav-item"><span>💰</span> 行政人員薪資</div>`;
                 nav.innerHTML += `<div onclick="openExternalSystem('salary_caregiver.html', this)" class="nav-item"><span>🏥</span> 居服員薪資</div>`;
             }
-            if (hasPermission('allowedAssessment')) { nav.innerHTML += `<div onclick="openExternalSystem('assessment.html', this)" class="nav-item"><span>📋</span> 考核評鑑系統</div>`; }
-            if (currentUser.role === 'super_admin') { nav.innerHTML += `<div class="mt-auto border-t pt-2"><div onclick="switchTab('settings')" id="nav-settings" class="nav-item"><span>⚙️</span> 系統權限設定</div></div>`; }
+            if (isSuper || hasPermission('allowedAssessment')) { nav.innerHTML += `<div onclick="openExternalSystem('assessment.html', this)" class="nav-item"><span>📋</span> 考核評鑑系統</div>`; }
+            
+            if (isSuper) { nav.innerHTML += `<div class="mt-auto border-t pt-2"><div onclick="switchTab('settings')" id="nav-settings" class="nav-item"><span>⚙️</span> 系統權限設定</div></div>`; }
         }
 
-        function hasPermission(permKey) { if(!currentUser) return false; if(currentUser.role === 'super_admin') return true; return systemSettings[permKey]?.includes(currentUser.id); }
+        function hasPermission(permKey) { 
+            if(!currentUser) return false; 
+            // Super Admin 永遠回傳 true
+            if(currentUser.role === 'super_admin') return true; 
+            return systemSettings[permKey]?.includes(currentUser.id); 
+        }
 
         function switchTab(tabId) {
             document.getElementById('iframe-container').classList.add('hidden');
@@ -230,15 +283,17 @@
             const container = document.getElementById('iframe-container');
             const frame = document.getElementById('app-frame');
             container.classList.remove('hidden');
-            if(frame.getAttribute('src') !== url) frame.src = url;
+            // 防止重複載入
+            if(!frame.getAttribute('src') || frame.getAttribute('src') !== url) {
+                frame.src = url;
+            }
             document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
             if(element) element.classList.add('active');
         }
 
-        function logout() { sessionStorage.removeItem('kuangyou_user'); window.location.href = 'index.html'; }
         function navigate(url, el) { openExternalSystem(url, el); }
 
-        // --- 業務邏輯 ---
+        // --- 業務邏輯 (維持不變) ---
         function loadPendingRequests(){
             const q = query(collection(db, "requests"), where("status", "==", "pending"));
             onSnapshot(q, (snap) => {
@@ -275,7 +330,6 @@
             }, 100);
         }
 
-        // ★★★ 核心修復：正確寫入歷史紀錄 (leave_records) ★★★
         async function processRequest(reqId, action) {
             if (action === 'rejected') {
                 const reason = prompt("請輸入駁回原因：", "資料不全");
@@ -293,10 +347,8 @@
             const reqData = reqSnap.data();
             const batch = writeBatch(db);
 
-            // 更新申請單狀態
             batch.update(reqRef, { status: 'approved', reviewedAt: new Date().toISOString() });
 
-            // 1. 加班 -> 自動增加補休存摺
             if (reqData.category === 'overtime') {
                 const ledgerRef = doc(collection(db, "leave_ledger"));
                 batch.set(ledgerRef, {
@@ -309,19 +361,16 @@
                     createdAt: new Date().toISOString()
                 });
             } 
-            // 2. 請假 (處理所有假別)
             else if (reqData.category === 'leave') {
                 let deductionLog = [];
                 let isPaidLeave = (reqData.type === '特休' || reqData.type === '補休');
 
-                // 如果是特休/補休，執行扣款邏輯
                 if (isPaidLeave) {
                     const qLedger = query(collection(db, "leave_ledger"), where("empId", "==", reqData.empId));
                     const ledgerSnap = await getDocs(qLedger);
                     let ledgers = [];
                     ledgerSnap.forEach(d => ledgers.push({ id: d.id, ...d.data() }));
 
-                    // 過濾有效餘額 & 排序 (FIFO)
                     ledgers = ledgers.filter(l => l.remaining > 0 && dayjs(l.expiryDate).isAfter(dayjs()))
                                      .sort((a, b) => dayjs(a.expiryDate).unix() - dayjs(b.expiryDate).unix());
 
@@ -341,7 +390,6 @@
                     }
                 }
 
-                // ★ 無論是否扣款，都要寫入一筆「歷史紀錄」供查詢
                 const recordRef = doc(collection(db, "leave_records"));
                 batch.set(recordRef, {
                     empId: reqData.empId,
@@ -349,7 +397,7 @@
                     type: reqData.type,
                     hours: reqData.hours,
                     note: reqData.note || "線上申請核准",
-                    deductionLog: deductionLog, // 若是喪假則為空陣列，若是特休則有扣款紀錄
+                    deductionLog: deductionLog, 
                     createdAt: new Date().toISOString()
                 });
             }

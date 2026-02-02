@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>行政人員薪資管理系統 (免索引修復版)</title>
+    <title>行政人員薪資管理系統 (會計歸檔版)</title>
     
     <script>
         (function() {
@@ -37,9 +37,10 @@
         #batch-container { position: absolute; top: -9999px; left: -9999px; }
     </style>
 
-    <script type="module">
+ <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
         import { getFirestore, collection, doc, getDoc, setDoc, onSnapshot, query, where, getDocs } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore.js";
+        import { getAuth, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js";
 
         const firebaseConfig = {
             apiKey: "AIzaSyDkC6kfqpmEeMKIvWIqftounTSH_NPp25M",
@@ -53,8 +54,11 @@
 
         const app = initializeApp(firebaseConfig);
         const db = getFirestore(app);
-        
+        const auth = getAuth(app);
+
         window.db = db;
+        window.auth = auth;
+        window.onAuthStateChanged = onAuthStateChanged;
         window.collection = collection;
         window.doc = doc;
         window.setDoc = setDoc;
@@ -81,10 +85,19 @@
         const DEFAULT_MONTHLY_DATA = {
             performanceBonus: 0, festivalBonus: 0, birthdayBonus: 0, otherPlus: 0,
             otherDeduct: 0, pensionSelfRate: 0,
-            sickLeaveHours: 0, personalLeaveHours: 0, specialLeaveHours: 0, 
-            compLeaveHours: 0, ritualLeaveHours: 0, officialLeaveHours: 0,
+            
+            // 扣款類 (半薪/無薪)
+            sickLeaveHours: 0, menstrualLeaveHours: 0,
+            personalLeaveHours: 0, familyCareLeaveHours: 0,
+
+            // 不扣款類 (全薪)
+            specialLeaveHours: 0, compLeaveHours: 0, funeralLeaveHours: 0,
+            weddingLeaveHours: 0, prenatalLeaveHours: 0, paternityLeaveHours: 0,
+            maternityLeaveHours: 0, ritualLeaveHours: 0, officialLeaveHours: 0,
+
             note: '',
-            snapshot: null 
+            snapshot: null,
+            finalResult: null // ★ 新增：用於儲存計算結果
         };
 
         const PayrollSystem = () => {
@@ -141,15 +154,21 @@
                 setMonthlyDataMap({ ...monthlyDataMap, [selectedEmpId]: { ...current, [field]: value } });
             };
 
+            // ★ 修改：儲存時連同計算結果一起存入 (Accounting Ready)
             const handleSave = async () => {
                 setLoading(true);
                 try {
                     const dataToSave = { ...monthlyDataMap };
+                    
                     Object.keys(dataToSave).forEach(empId => {
                         const emp = employees.find(e => e.id === empId);
                         if (emp) {
+                            // 1. 執行計算
+                            const result = calculatePayroll(emp, dataToSave[empId]);
+                            
                             dataToSave[empId] = {
                                 ...dataToSave[empId],
+                                // 2. 更新參數快照 (Input)
                                 snapshot: {
                                     baseSalary: emp.baseSalary,
                                     positionBonus: emp.positionBonus,
@@ -157,17 +176,27 @@
                                     laborIns: emp.laborIns,
                                     healthIns: emp.healthIns,
                                     insuranceLevel: emp.insuranceLevel
+                                },
+                                // 3. ★ 新增：儲存計算結果 (Output)
+                                finalResult: {
+                                    grossSalary: result.grossSalary, // 應發
+                                    netSalary: result.netSalary,     // 實領
+                                    employerPension: result.pensionCompany, // 公司提撥6%
+                                    totalDeduction: result.deductRightTotal + result.deductLeftTotal, // 總扣款
+                                    payDays: result.payDays,
+                                    isProrated: result.isProrated,
+                                    calculatedAt: new Date().toISOString()
                                 }
                             };
                         }
                     });
+
                     await window.setDoc(window.doc(window.db, "salary_records_admin", currentMonth), dataToSave, { merge: true });
-                    alert("✅ 薪資資料已儲存");
+                    alert("✅ 薪資資料已儲存 (含會計歸檔數據)");
                 } catch (e) { console.error(e); alert("儲存失敗"); }
                 setLoading(false);
             };
 
-            // ★ Action: 自動從請假紀錄帶入 (免索引改良版 - 修復)
             const handleAutoFill = async () => {
                 if (!selectedEmpId) return;
                 setLoading(true);
@@ -175,10 +204,6 @@
                     const startStr = `${currentMonth}-01`;
                     const endStr = dayjs(currentMonth).endOf('month').format('YYYY-MM-DD');
                     
-                    console.log(`查詢區間: ${startStr} ~ ${endStr} for ${selectedEmpId}`);
-
-                    // ★ 關鍵修正：移除 where("date", ...) 只保留 empId
-                    // 這樣就不會觸發 Firebase 的複合索引錯誤
                     const qLeave = window.query(
                         window.collection(window.db, "leave_records"), 
                         window.where("empId", "==", selectedEmpId)
@@ -188,9 +213,10 @@
                     
                     let newData = { ...getCurrentData(selectedEmpId) };
                     
-                    // 重置數值
-                    newData.sickLeaveHours = 0; newData.personalLeaveHours = 0; 
-                    newData.specialLeaveHours = 0; newData.compLeaveHours = 0; 
+                    // 重置
+                    Object.keys(DEFAULT_MONTHLY_DATA).forEach(k => {
+                        if(k.endsWith('Hours')) newData[k] = 0;
+                    });
                     newData.otherPlus = 0;
                     
                     let cashOutTotal = 0; 
@@ -199,17 +225,26 @@
 
                     snapshot.forEach(doc => {
                         const r = doc.data();
-                        
-                        // ★ 本地端過濾日期 (Client-side Filtering)
                         if (r.date >= startStr && r.date <= endStr) {
                             matchCount++;
                             const hours = Number(r.hours) || 0;
+                            const type = r.type || "";
                             
-                            if (r.type.includes('病') || r.type.includes('生理')) newData.sickLeaveHours += hours;
-                            else if (r.type.includes('事')) newData.personalLeaveHours += hours;
-                            else if (r.type.includes('特休')) newData.specialLeaveHours += hours;
-                            else if (r.type.includes('補休')) newData.compLeaveHours += hours;
-                            else if (r.type === 'cash_out') {
+                            if (type.includes('生理')) newData.menstrualLeaveHours += hours;
+                            else if (type.includes('病')) newData.sickLeaveHours += hours;
+                            else if (type.includes('家庭')) newData.familyCareLeaveHours += hours;
+                            else if (type.includes('事')) newData.personalLeaveHours += hours;
+                            else if (type.includes('特休')) newData.specialLeaveHours += hours;
+                            else if (type.includes('補休')) newData.compLeaveHours += hours;
+                            else if (type.includes('婚')) newData.weddingLeaveHours += hours;
+                            else if (type.includes('喪')) newData.funeralLeaveHours += hours;
+                            else if (type.includes('產檢')) newData.prenatalLeaveHours += hours;
+                            else if (type.includes('陪產')) newData.paternityLeaveHours += hours;
+                            else if (type.includes('產')) newData.maternityLeaveHours += hours;
+                            else if (type.includes('祭儀')) newData.ritualLeaveHours += hours;
+                            else if (type.includes('公')) newData.officialLeaveHours += hours;
+                            
+                            else if (type === 'cash_out') {
                                 const emp = employees.find(e => e.id == selectedEmpId);
                                 if(emp) {
                                     const hourlyRate = (emp.baseSalary + emp.positionBonus) / 240; 
@@ -227,17 +262,9 @@
                     }
 
                     setMonthlyDataMap({ ...monthlyDataMap, [selectedEmpId]: newData });
-                    
-                    if (matchCount === 0) {
-                        alert(`⚠️ 查詢成功，但該員工在 ${currentMonth} 沒有任何請假紀錄。`);
-                    } else {
-                        alert(`✅ 自動帶入成功！\n共找到 ${matchCount} 筆本月紀錄。`);
-                    }
+                    alert(`✅ 自動帶入成功！\n找到 ${matchCount} 筆資料。`);
 
-                } catch(e) { 
-                    console.error("AutoFill Error:", e); 
-                    alert(`❌ 自動帶入失敗：${e.message}`);
-                }
+                } catch(e) { console.error(e); alert(`❌ 失敗：${e.message}`); }
                 setLoading(false);
             };
 
@@ -283,8 +310,13 @@
                 const birth = Number(data.birthdayBonus) || 0;
                 const otherP = Number(data.otherPlus) || 0;
 
-                const sickDeduct = Math.round(hourlyRate * (Number(data.sickLeaveHours) || 0) / 2);
-                const personalDeduct = Math.round(hourlyRate * (Number(data.personalLeaveHours) || 0));
+                // 勞基法扣款計算
+                const halfPayHours = (Number(data.sickLeaveHours) || 0) + (Number(data.menstrualLeaveHours) || 0);
+                const sickDeduct = Math.round(hourlyRate * halfPayHours * 0.5);
+
+                const noPayHours = (Number(data.personalLeaveHours) || 0) + (Number(data.familyCareLeaveHours) || 0);
+                const personalDeduct = Math.round(hourlyRate * noPayHours);
+
                 const otherD = Number(data.otherDeduct) || 0;
 
                 const laborIns = Math.round(laborInsFull * ratio);
@@ -335,7 +367,9 @@
                                 ${[
                                     ['本薪', r.base, r.isProrated ? `(原:${r.baseFull})` : '', ''], 
                                     ['職務加給', r.pos, '', ''], ['績效獎金', r.perf, '', ''], ['三節禮金', r.fest, '', ''], ['生日禮金', r.birth, '', ''], ['油資補助', r.fuel, '', ''], ['其他(加)', r.otherP, '', ''],
-                                    ['病/生理假(扣)', r.sickDeduct ? -r.sickDeduct : 0, '', 'color:red;'], ['事假(扣)', r.personalDeduct ? -r.personalDeduct : 0, '', 'color:red;'], ['其他(扣)', r.otherD ? -r.otherD : 0, '', 'color:red;']
+                                    ['半薪假扣款', r.sickDeduct ? -r.sickDeduct : 0, '(病假/生理假)', 'color:red;'], 
+                                    ['全薪假扣款', r.personalDeduct ? -r.personalDeduct : 0, '(事假/家庭照顧)', 'color:red;'], 
+                                    ['其他(扣)', r.otherD ? -r.otherD : 0, '', 'color:red;']
                                 ].map(i => `<tr style="border-bottom: 1px dotted #ccc;"><td style="padding: 4px 0;">${i[0]} <span style="font-size:10px;color:#888">${i[2]||''}</span></td><td style="text-align: right; font-family: monospace; ${i[3]||''}">${i[1]!==0?new Intl.NumberFormat('zh-TW').format(i[1]):'-'}</td></tr>`).join('')}
                                 <tr style="font-weight: bold; border-top: 2px solid black;"><td style="padding: 8px 0;">薪資小計</td><td style="text-align: right;">${new Intl.NumberFormat('zh-TW', {style:'currency',currency:'TWD',minimumFractionDigits:0}).format(r.incomeTotal - r.deductLeftTotal)}</td></tr>
                             </table>
@@ -350,13 +384,20 @@
                             </div>
                             <div>
                                 <div style="background: #f0f0f0; border-top: 1px solid black; border-bottom: 1px solid black; font-weight: bold; padding: 4px 8px; margin-bottom: 8px;">工時與假別 (小時)</div>
-                                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 14px;">
-                                    <div>特休: ${r.data.specialLeaveHours}</div>
-                                    <div>補休: ${r.data.compLeaveHours}</div>
-                                    <div>歲時祭儀: ${r.data.ritualLeaveHours}</div>
-                                    <div>公假: ${r.data.officialLeaveHours}</div>
-                                    <div>病/生理假: ${r.data.sickLeaveHours}</div>
-                                    <div>事假: ${r.data.personalLeaveHours}</div>
+                                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 13px;">
+                                    ${r.data.specialLeaveHours ? `<div>特休: ${r.data.specialLeaveHours}</div>` : ''}
+                                    ${r.data.compLeaveHours ? `<div>補休: ${r.data.compLeaveHours}</div>` : ''}
+                                    ${r.data.sickLeaveHours ? `<div>病假: ${r.data.sickLeaveHours}</div>` : ''}
+                                    ${r.data.personalLeaveHours ? `<div>事假: ${r.data.personalLeaveHours}</div>` : ''}
+                                    ${r.data.menstrualLeaveHours ? `<div>生理假: ${r.data.menstrualLeaveHours}</div>` : ''}
+                                    ${r.data.familyCareLeaveHours ? `<div>家庭照顧: ${r.data.familyCareLeaveHours}</div>` : ''}
+                                    ${r.data.weddingLeaveHours ? `<div>婚假: ${r.data.weddingLeaveHours}</div>` : ''}
+                                    ${r.data.funeralLeaveHours ? `<div>喪假: ${r.data.funeralLeaveHours}</div>` : ''}
+                                    ${r.data.prenatalLeaveHours ? `<div>產檢假: ${r.data.prenatalLeaveHours}</div>` : ''}
+                                    ${r.data.paternityLeaveHours ? `<div>陪產假: ${r.data.paternityLeaveHours}</div>` : ''}
+                                    ${r.data.maternityLeaveHours ? `<div>產假: ${r.data.maternityLeaveHours}</div>` : ''}
+                                    ${r.data.ritualLeaveHours ? `<div>歲時祭儀: ${r.data.ritualLeaveHours}</div>` : ''}
+                                    ${r.data.officialLeaveHours ? `<div>公假: ${r.data.officialLeaveHours}</div>` : ''}
                                 </div>
                             </div>
                             <div style="border: 1px solid black; padding: 8px; margin-top: auto; min-height: 80px;">
@@ -498,21 +539,32 @@
                                         </div>
 
                                         <div className="space-y-3">
-                                            <div className="text-xs font-bold text-slate-400 uppercase tracking-wider">假別時數 (自動計算扣款)</div>
-                                            <div className="bg-red-50 p-3 rounded-lg border border-red-100 space-y-2">
-                                                <div><label className="text-xs text-red-800 font-bold">病假/生理假 (時數)</label><input type="number" className="w-full p-2 border border-red-200 rounded" value={currentData.sickLeaveHours} onChange={e=>updateCurrentData('sickLeaveHours',e.target.value)} onFocus={e=>e.target.select()} placeholder="扣半薪" /></div>
-                                                <div><label className="text-xs text-red-800 font-bold">事假 (時數)</label><input type="number" className="w-full p-2 border border-red-200 rounded" value={currentData.personalLeaveHours} onChange={e=>updateCurrentData('personalLeaveHours',e.target.value)} onFocus={e=>e.target.select()} placeholder="扣全薪" /></div>
+                                            <div className="text-xs font-bold text-slate-400 uppercase tracking-wider">應扣款假別 (系統自動扣薪)</div>
+                                            <div className="bg-red-50 p-3 rounded-lg border border-red-100 space-y-3">
+                                                <div className="grid grid-cols-2 gap-2">
+                                                    <div><label className="text-xs text-red-800 font-bold">病假 (扣半薪)</label><input type="number" className="w-full p-2 border border-red-200 rounded" value={currentData.sickLeaveHours} onChange={e=>updateCurrentData('sickLeaveHours',e.target.value)} onFocus={e=>e.target.select()} /></div>
+                                                    <div><label className="text-xs text-red-800 font-bold">生理假 (扣半薪)</label><input type="number" className="w-full p-2 border border-red-200 rounded" value={currentData.menstrualLeaveHours} onChange={e=>updateCurrentData('menstrualLeaveHours',e.target.value)} onFocus={e=>e.target.select()} /></div>
+                                                </div>
+                                                <div className="grid grid-cols-2 gap-2">
+                                                    <div><label className="text-xs text-red-800 font-bold">事假 (扣全薪)</label><input type="number" className="w-full p-2 border border-red-200 rounded" value={currentData.personalLeaveHours} onChange={e=>updateCurrentData('personalLeaveHours',e.target.value)} onFocus={e=>e.target.select()} /></div>
+                                                    <div><label className="text-xs text-red-800 font-bold">家庭照顧 (扣全薪)</label><input type="number" className="w-full p-2 border border-red-200 rounded" value={currentData.familyCareLeaveHours} onChange={e=>updateCurrentData('familyCareLeaveHours',e.target.value)} onFocus={e=>e.target.select()} /></div>
+                                                </div>
                                             </div>
                                             <div><label className="text-xs text-slate-500">其他扣款 (金額)</label><input type="number" className="w-full p-2 border rounded text-red-600 font-mono" value={currentData.otherDeduct} onChange={e=>updateCurrentData('otherDeduct',e.target.value)} onFocus={e=>e.target.select()} /></div>
                                         </div>
 
                                         <div className="space-y-3">
-                                            <div className="text-xs font-bold text-slate-400 uppercase tracking-wider">純紀錄假別 (不扣款)</div>
-                                            <div className="grid grid-cols-2 gap-2">
-                                                <div><label className="text-xs text-slate-500">特休</label><input type="number" className="w-full p-2 border rounded bg-slate-50" value={currentData.specialLeaveHours} onChange={e=>updateCurrentData('specialLeaveHours',e.target.value)} onFocus={e=>e.target.select()} /></div>
-                                                <div><label className="text-xs text-slate-500">補休</label><input type="number" className="w-full p-2 border rounded bg-slate-50" value={currentData.compLeaveHours} onChange={e=>updateCurrentData('compLeaveHours',e.target.value)} onFocus={e=>e.target.select()} /></div>
-                                                <div><label className="text-xs text-slate-500">歲時祭儀</label><input type="number" className="w-full p-2 border rounded bg-slate-50" value={currentData.ritualLeaveHours} onChange={e=>updateCurrentData('ritualLeaveHours',e.target.value)} onFocus={e=>e.target.select()} /></div>
-                                                <div><label className="text-xs text-slate-500">公假</label><input type="number" className="w-full p-2 border rounded bg-slate-50" value={currentData.officialLeaveHours} onChange={e=>updateCurrentData('officialLeaveHours',e.target.value)} onFocus={e=>e.target.select()} /></div>
+                                            <div className="text-xs font-bold text-slate-400 uppercase tracking-wider">不扣薪假別 (純紀錄)</div>
+                                            <div className="grid grid-cols-3 gap-2">
+                                                <div><label className="text-xs text-slate-500">特休</label><input type="number" className="w-full p-2 border rounded bg-slate-50" value={currentData.specialLeaveHours} onChange={e=>updateCurrentData('specialLeaveHours',e.target.value)} /></div>
+                                                <div><label className="text-xs text-slate-500">補休</label><input type="number" className="w-full p-2 border rounded bg-slate-50" value={currentData.compLeaveHours} onChange={e=>updateCurrentData('compLeaveHours',e.target.value)} /></div>
+                                                <div><label className="text-xs text-slate-500">公假</label><input type="number" className="w-full p-2 border rounded bg-slate-50" value={currentData.officialLeaveHours} onChange={e=>updateCurrentData('officialLeaveHours',e.target.value)} /></div>
+                                                <div><label className="text-xs text-slate-500">婚假</label><input type="number" className="w-full p-2 border rounded bg-slate-50" value={currentData.weddingLeaveHours} onChange={e=>updateCurrentData('weddingLeaveHours',e.target.value)} /></div>
+                                                <div><label className="text-xs text-slate-500">喪假</label><input type="number" className="w-full p-2 border rounded bg-slate-50" value={currentData.funeralLeaveHours} onChange={e=>updateCurrentData('funeralLeaveHours',e.target.value)} /></div>
+                                                <div><label className="text-xs text-slate-500">產檢</label><input type="number" className="w-full p-2 border rounded bg-slate-50" value={currentData.prenatalLeaveHours} onChange={e=>updateCurrentData('prenatalLeaveHours',e.target.value)} /></div>
+                                                <div><label className="text-xs text-slate-500">陪產</label><input type="number" className="w-full p-2 border rounded bg-slate-50" value={currentData.paternityLeaveHours} onChange={e=>updateCurrentData('paternityLeaveHours',e.target.value)} /></div>
+                                                <div><label className="text-xs text-slate-500">產假</label><input type="number" className="w-full p-2 border rounded bg-slate-50" value={currentData.maternityLeaveHours} onChange={e=>updateCurrentData('maternityLeaveHours',e.target.value)} /></div>
+                                                <div><label className="text-xs text-slate-500">祭儀</label><input type="number" className="w-full p-2 border rounded bg-slate-50" value={currentData.ritualLeaveHours} onChange={e=>updateCurrentData('ritualLeaveHours',e.target.value)} /></div>
                                             </div>
                                         </div>
 
